@@ -1,6 +1,6 @@
 [package]
 name = "mokuzu"
-version = "0.5.34"
+version = "0.5.35"
 edition = "2024"
 description = "A self-hosted AI agent for Discord: text and voice chat, web search, memory, MCP tools, a code sandbox, and scheduled jobs"
 keywords = ["ai-agent", "discord-bot", "llm", "mcp", "self-hosted"]
