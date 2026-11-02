@@ -1,20 +1,56 @@
 <p align="center">
-  <img src="assets/icon.png" alt="mokuzu" width="200">
+  <img src="assets/icon.png" alt="mokuzu, a self-hosted AI agent for Discord" width="200">
 </p>
 
-# mokuzu
+# mokuzu: a self-hosted AI agent for Discord
 
-A personal agent that runs on your machine and talks with you over Discord, in text and in voice
-channels. It reads files and web pages, searches the web, remembers what you tell it, calls tools on MCP
-servers such as Linear, and runs scheduled jobs.
+<p align="center">
+  <a href="https://github.com/xianyuntang/mokuzu/releases/latest"><img src="https://img.shields.io/github/v/release/xianyuntang/mokuzu" alt="Latest release"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT or Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/built%20with-Rust-orange" alt="Built with Rust">
+  <img src="https://img.shields.io/badge/runs%20on-Raspberry%20Pi-c51a4a" alt="Runs on Raspberry Pi">
+</p>
 
-The name comes from the Japanese name for the mitten crab, whose hairy claws look like they hold
-a tuft of seaweed scraps.
+Mokuzu is an open-source personal AI assistant that runs on your own machine, such as a
+Raspberry Pi, and talks with you as a Discord bot, in text and in voice channels. It reads files
+and web pages, searches the web, remembers what you tell it, calls tools on MCP servers such as
+Linear or GitHub, runs code in a sandbox, and runs scheduled jobs and webhooks. It works with
+Claude through the Anthropic API, or with the models on OpenCode Go. It is one Rust binary.
 
 Mokuzu's own tools only read, except that it can write files, and run code in a sandbox, in its
 own workspace folder.
 Anything else that changes something (an MCP call or a settings change) asks you first, or goes
 past a reviewer model in auto mode.
+
+## Features
+
+- **Discord-native**: DMs, server channels, a thread per conversation, slash commands, approval
+  buttons, and a separate allow list for each server.
+- **Voice chat**: talk with it in a Discord voice channel through OpenAI's Realtime API; voice
+  messages are transcribed.
+- **Memory per person**: notes, skills, and todos for each user, plus search over past
+  conversations, in any language including Chinese and Japanese.
+- **Tools**: web search (SearXNG or Brave), web pages, PDF, Word, and PowerPoint files, and any
+  [MCP](https://modelcontextprotocol.io) server.
+- **Sandboxed code**: Python and shell in a bubblewrap sandbox with no network, for data analysis,
+  charts, and file conversion.
+- **Automation**: cron jobs, reminders, webhooks, and a heartbeat that follows up on open todos
+  (CI runs, reviews, replies) on its own.
+- **Agent swarm**: `/cast` sends out up to 10 subagents at once for broad research.
+- **Safe by default**: no shell on your machine; actions that change things wait for your
+  approval, or for a reviewer model in auto mode.
+- **Small and self-hosted**: one binary, a SQLite database, and a background service on Linux
+  or macOS.
+
+## Why mokuzu
+
+If you want a personal AI agent like OpenClaw but would rather not give a model a shell on your
+machine, mokuzu takes the other road: it reads freely, writes only to its own workspace, and asks
+before anything else. It is built for Discord first, so a whole server can share one bot while
+each person keeps their own memory, and you can talk with it in a voice channel.
+
+The name comes from the Japanese name for the mitten crab, whose hairy claws look like they hold
+a tuft of seaweed scraps.
 
 ## Install
 
@@ -236,6 +272,33 @@ setting; nothing falls back to a hidden default. Its `version` is the file's for
 update changes the format, mokuzu migrates the file on start, keeping the old one as
 `config.toml.bak`. MCP servers you added by hand are kept as written. Most changes apply from the next
 message; MCP servers, web search, and Discord need a restart.
+
+## FAQ
+
+### Can I run mokuzu on a Raspberry Pi?
+
+Yes. The release binary is built for Linux on arm64, such as a Raspberry Pi 4 or 5 with a 64-bit
+OS. Other platforms build from source with `cargo install`.
+
+### Which LLMs does it work with?
+
+Claude through an Anthropic API key, or the models on OpenCode Go, chosen in `mokuzu configure`.
+Voice calls and voice message transcripts also need an OpenAI API key.
+
+### Does it work outside Discord?
+
+No. Mokuzu runs only as a Discord bot, in DMs, server channels, threads, and voice channels.
+
+### Is it safe to run on my own machine?
+
+Its own tools cannot change anything outside its workspace folder, hidden files such as `~/.ssh`
+are refused, and code runs in a sandbox without network. MCP calls and settings changes need
+your approval, or a reviewer model's in auto mode. See [Approval](#approval).
+
+### Is it free?
+
+Mokuzu is free and open source under MIT or Apache-2.0. You pay your model provider for what
+it uses.
 
 ## Development
 
