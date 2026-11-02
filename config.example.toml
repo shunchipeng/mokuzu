@@ -19,8 +19,9 @@ provider = "opencode-go"
 # Endpoint format. "anthropic" (/messages), "openai" (/chat/completions), "responses"
 # (/responses), or "gemini" (generateContent). On OpenCode Go: minimax*/qwen*/claude* use
 # anthropic, gpt*/grok*/muse* responses, gemini* gemini, and everything else openai. Anthropic
-# speaks only "anthropic". Copilot uses "responses" for model IDs containing "codex" and
-# "openai" for others (including Claude); ChatGPT uses only "responses".
+# speaks only "anthropic". Copilot defaults to "responses" for GPT-5.6, GPT-6, and Codex,
+# and "openai" for other models (including Claude). Override it in Advanced when needed.
+# ChatGPT uses only "responses".
 api = "anthropic"
 max_tokens = 16000
 # When the conversation grows past about this many tokens, long tool output in older turns is
@@ -40,9 +41,9 @@ base_url = "https://opencode.ai/zen/go/v1"
 
 # Subscription OAuth: run `mokuzu login github-copilot` or `mokuzu login chatgpt`, then select
 # the matching model.provider and model.api above. No api_key; endpoints are fixed.
-# Example Copilot model: "gpt-5.3-codex" (api = "responses"), or "claude-sonnet-4.6" ("openai").
+# Example Copilot model: "gpt-4.1" (api = "openai"), or "gpt-6-luna" ("responses") if available.
 # [github-copilot]
-# Example ChatGPT model: "gpt-5.3-codex" (api = "responses").
+# Example ChatGPT model: "gpt-6.1-sol" (api = "responses").
 # [chatgpt]
 
 # How MCP calls and settings changes get approved. "ask" asks you every time; "auto" lets the

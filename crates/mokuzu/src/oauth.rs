@@ -14,7 +14,7 @@ use rig_core::completion::{
 };
 use rig_core::providers::{chatgpt, copilot};
 
-use crate::config::{Config, Provider};
+use crate::config::{Api, Config, Provider};
 
 enum Client {
     Copilot(copilot::Client),
@@ -34,7 +34,10 @@ type Clients = BTreeMap<(PathBuf, Provider), CachedClient>;
 static CLIENTS: OnceLock<Mutex<Clients>> = OnceLock::new();
 
 pub(crate) enum Model {
-    Copilot(<copilot::Client as CompletionClient>::CompletionModel),
+    Copilot {
+        model: <copilot::Client as CompletionClient>::CompletionModel,
+        name: String,
+    },
     Chatgpt(<chatgpt::Client as CompletionClient>::CompletionModel),
 }
 
@@ -53,7 +56,7 @@ impl Model {
             }),
         };
         Ok(match &cached.client {
-            Client::Copilot(client) => Self::Copilot(client.completion_model(&config.model)),
+            Client::Copilot(client) => copilot_model(client, &config.model, config.api),
             Client::Chatgpt(client) => Self::Chatgpt(client.completion_model(&config.model)),
         })
     }
@@ -71,9 +74,28 @@ impl Model {
             }
         }
         match self {
-            Self::Copilot(model) => model.completion(request).await,
+            Self::Copilot { model, name } => {
+                request.model = Some(name.clone());
+                model.completion(request).await
+            }
             Self::Chatgpt(model) => model.completion(request).await,
         }
+    }
+}
+
+fn copilot_model(client: &copilot::Client, name: &str, api: Api) -> Model {
+    // Rig 0.42 chooses Copilot's transport from the configured model before applying
+    // the public per-request model override. Its Responses route only recognizes
+    // Codex names. Select that transport, then send the actual model via request.model;
+    // the routing selector is never sent to the service. This also supports GPT-6.
+    let route = if api == Api::Responses {
+        copilot::GPT_5_3_CODEX
+    } else {
+        name
+    };
+    Model::Copilot {
+        model: client.completion_model(route),
+        name: name.to_owned(),
     }
 }
 
@@ -361,10 +383,17 @@ mod tests {
     async fn both_subscription_transports_return_tool_calls_for_mokuzu_to_approve() {
         crate::install_tls_provider();
         for (chatgpt, responses) in [(false, false), (false, true), (true, true)] {
+            let name = if chatgpt {
+                "gpt-6.1-sol"
+            } else if responses {
+                "gpt-6-luna"
+            } else {
+                "claude-sonnet-5.5"
+            };
             let tool = json!({"name": "read_file", "arguments": "{\"path\":\"/tmp/note\"}"});
             let responses_reply = json!({
                 "id": "resp_test", "object": "response", "created_at": 1,
-                "status": "completed", "model": "gpt-5.3-codex",
+                "status": "completed", "model": name,
                 "output": [{"type": "function_call", "id": "fc_test", "call_id": "call_test",
                     "name": tool["name"], "arguments": tool["arguments"], "status": "completed"}],
                 "tools": [], "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
@@ -380,7 +409,7 @@ mod tests {
             } else if responses {
                 responses_reply.to_string()
             } else {
-                json!({"id": "chatcmpl-test", "object": "chat.completion", "created": 1, "model": "claude-sonnet-4.6",
+                json!({"id": "chatcmpl-test", "object": "chat.completion", "created": 1, "model": name,
                     "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
                         "role": "assistant", "content": null,
                         "tool_calls": [{"id": "call_test", "type": "function", "function": tool}]
@@ -399,20 +428,21 @@ mod tests {
                         .default_instructions("")
                         .build()
                         .unwrap()
-                        .completion_model("gpt-5.3-codex"),
+                        .completion_model(name),
                 )
             } else {
-                Model::Copilot(
-                    copilot::Client::builder()
+                copilot_model(
+                    &copilot::Client::builder()
                         .api_key("test-token")
                         .base_url(&url)
                         .build()
-                        .unwrap()
-                        .completion_model(if responses {
-                            "gpt-5.3-codex"
-                        } else {
-                            "claude-sonnet-4.6"
-                        }),
+                        .unwrap(),
+                    name,
+                    if responses {
+                        Api::Responses
+                    } else {
+                        Api::Openai
+                    },
                 )
             };
             let config = Config::parse("[opencode-go]\napi_key = \"unused\"\n").unwrap();
@@ -440,6 +470,11 @@ mod tests {
                 AssistantContent::ToolCall(call) if call.function.name == "read_file"
                     && call.function.arguments["path"] == "/tmp/note")));
             let (headers, body) = server.await.unwrap();
+            assert_eq!(
+                body["model"], name,
+                "the actual selected model must reach the service"
+            );
+            assert!(!body.to_string().contains(copilot::GPT_5_3_CODEX));
             assert!(headers.starts_with(if responses {
                 "POST /responses "
             } else {

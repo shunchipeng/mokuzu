@@ -49,8 +49,14 @@ const OPENCODE_GO: &str = "OpenCode Go";
 const ANTHROPIC: &str = "Anthropic";
 const GITHUB_COPILOT: &str = "GitHub Copilot (OAuth)";
 const CHATGPT: &str = "OpenAI ChatGPT (OAuth)";
-const COPILOT_MODELS: &[&str] = &["gpt-5.3-codex", "claude-sonnet-4.6"];
-const CHATGPT_MODELS: &[&str] = &["gpt-5.3-codex", "gpt-5.4"];
+const COPILOT_MODELS: &[&str] = &[
+    "gpt-4.1",
+    "gpt-6-luna",
+    "gpt-6.1-sol",
+    "claude-sonnet-5.5",
+    "claude-haiku-5.5",
+];
+const CHATGPT_MODELS: &[&str] = &["gpt-6.1-sol", "gpt-6-luna"];
 const CUSTOM: &str = "Custom…";
 const ENABLED: &str = "Enabled";
 const DISABLED: &str = "Disabled";
@@ -225,6 +231,16 @@ fn provider_name(provider: Provider) -> &'static str {
 
 fn options(values: &[&str]) -> Vec<String> {
     values.iter().map(|v| (*v).to_owned()).collect()
+}
+
+fn api_options(provider: Provider) -> Vec<String> {
+    let mut apis = vec![API_AUTO];
+    if provider == Provider::GithubCopilot {
+        apis.extend(["openai", "responses"]);
+    } else {
+        apis.extend(Api::ALL.map(Api::name));
+    }
+    options(&apis)
 }
 
 /// `values` plus `current` when it isn't one of them, so a hand-edited value survives.
@@ -437,12 +453,10 @@ impl Form {
             Some(c) if c.api != c.provider.api_for(&c.model) => c.api.name(),
             _ => API_AUTO,
         };
-        let mut apis = vec![API_AUTO];
-        apis.extend(Api::ALL.map(Api::name));
         fields.push(field(
             STEP_ADVANCED,
             "API format",
-            Kind::Select(options(&apis)),
+            Kind::Select(api_options(provider)),
             api.to_owned(),
         ));
         fields.push(field(
@@ -632,7 +646,10 @@ impl Form {
                 MCP_COMMAND | MCP_ARGS | MCP_ENV => self.fields[MCP_ADD].value == STDIO,
                 MCP_URL | MCP_TOKEN => self.fields[MCP_ADD].value == HTTP,
                 REVIEWER => self.fields[APPROVAL].value == AUTO,
-                API => self.provider() == Provider::OpencodeGo,
+                API => matches!(
+                    self.provider(),
+                    Provider::OpencodeGo | Provider::GithubCopilot
+                ),
                 KEY | BASE_URL => !self.provider().uses_oauth(),
                 _ => true,
             }
@@ -841,6 +858,8 @@ impl Form {
     /// API key and base URL, keeping `from`'s for when it is picked again.
     fn switch_provider(&mut self, from: Provider) {
         let to = self.provider();
+        self.fields[API].kind = Kind::Select(api_options(to));
+        self.fields[API].value = API_AUTO.to_owned();
         let left = (self.value(KEY), self.value(BASE_URL));
         self.keys.insert(from, left);
         let (key, url) = self
@@ -953,7 +972,9 @@ impl Form {
         let provider = self.provider();
         let api = match self.value(API) {
             // Anthropic speaks only its own format.
-            api if api == API_AUTO || provider != Provider::OpencodeGo => {
+            api if api == API_AUTO
+                || matches!(provider, Provider::Anthropic | Provider::Chatgpt) =>
+            {
                 provider.api_for(&self.model()?).name().to_owned()
             }
             api => api,
@@ -2200,7 +2221,7 @@ mod tests {
         form.check_step(STEP_MODEL).unwrap();
         assert!(!form.visible().contains(&KEY));
         assert!(form.value(KEY).is_empty());
-        assert_eq!(form.model_options().unwrap().api, "responses");
+        assert_eq!(form.model_options().unwrap().api, "openai");
         form.fields[PROVIDER].value = CHATGPT.to_owned();
         form.switch_provider(Provider::GithubCopilot);
         form.check_step(STEP_MODEL).unwrap();
@@ -2225,6 +2246,29 @@ mod tests {
         assert!(reopened.value(KEY).is_empty());
         let config = Config::parse(&render_toml(&reopened.answers().unwrap())).unwrap();
         assert_eq!(config.provider, Provider::GithubCopilot);
+    }
+
+    #[test]
+    fn copilot_advanced_wire_format_override_survives_save_and_reopen() {
+        let mut form = Form::new(None).unwrap();
+        form.fields[TOKEN].value = "discord-token".to_owned();
+        form.fields[USERS].value = "1".to_owned();
+        form.fields[PROVIDER].value = GITHUB_COPILOT.to_owned();
+        form.switch_provider(Provider::OpencodeGo);
+        form.fields[MODEL].value = CUSTOM.to_owned();
+        form.fields[CUSTOM_MODEL].value = "future-model".to_owned();
+        form.fields[API].value = "responses".to_owned();
+        form.step = STEP_ADVANCED;
+        assert!(form.visible().contains(&API));
+        let Kind::Select(options) = &form.fields[API].kind else {
+            panic!("API selector")
+        };
+        assert_eq!(options, &[API_AUTO, "openai", "responses"]);
+        let config = Config::parse(&render_toml(&form.answers().unwrap())).unwrap();
+        assert_eq!(config.api, Api::Responses);
+        let reopened = Form::new(Some(&config)).unwrap();
+        assert_eq!(reopened.value(API), "responses");
+        assert_eq!(reopened.model_options().unwrap().api, "responses");
     }
 
     #[test]

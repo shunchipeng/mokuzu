@@ -125,8 +125,9 @@ starting point, and **Custom…** accepts other model IDs your account can use.
 
 These integrations use the Copilot API and the ChatGPT Codex subscription backend through
 [Rig's built-in providers](https://docs.rs/rig-core/0.42.0/rig_core/providers/index.html).
-Rig handles device-code polling, cached access tokens, and token renewal. Copilot chooses Chat
-Completions or Responses for each model; ChatGPT uses Responses with streaming and no server
+Rig handles device-code polling, cached access tokens, and token renewal. Copilot defaults to
+Responses for GPT-5.6, GPT-6, and Codex models and Chat Completions for others; **Advanced → API
+format** can override that choice. ChatGPT uses Responses with streaming and no server
 storage. Mokuzu continues to execute tools through its own approval and sandbox mechanisms.
 Voice still needs its separate OpenAI API key.
 

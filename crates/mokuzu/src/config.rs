@@ -103,12 +103,21 @@ impl Provider {
         matches!(self, Self::GithubCopilot | Self::Chatgpt)
     }
 
-    /// The format `model` speaks here. Copilot's model routing matches Rig's provider.
+    /// Default wire format. Copilot can override this for models with different endpoint support.
     pub fn api_for(self, model: &str) -> Api {
         match self {
             Self::OpencodeGo => Api::for_model(model),
             Self::Anthropic => Api::Anthropic,
-            Self::GithubCopilot if model.to_ascii_lowercase().contains("codex") => Api::Responses,
+            Self::GithubCopilot
+                if {
+                    let name = model.to_ascii_lowercase();
+                    name.contains("codex")
+                        || name.starts_with("gpt-6")
+                        || name.starts_with("gpt-5.6")
+                } =>
+            {
+                Api::Responses
+            }
             Self::GithubCopilot => Api::Openai,
             Self::Chatgpt => Api::Responses,
         }
@@ -137,8 +146,8 @@ impl Provider {
         match self {
             Self::OpencodeGo => "minimax-m3",
             Self::Anthropic => "claude-opus-5-5",
-            Self::GithubCopilot => "gpt-5.3-codex",
-            Self::Chatgpt => "gpt-5.3-codex",
+            Self::GithubCopilot => "gpt-4.1",
+            Self::Chatgpt => "gpt-6.1-sol",
         }
     }
 }
@@ -700,12 +709,11 @@ impl Config {
         if provider == Provider::Anthropic && api != Api::Anthropic {
             bail!("[anthropic] only speaks model.api = \"anthropic\"");
         }
-        if provider.uses_oauth() && api != provider.api_for(&model) {
-            bail!(
-                "[{}] requires model.api = {:?} for this model",
-                provider.section(),
-                provider.api_for(&model).name()
-            );
+        if provider == Provider::Chatgpt && api != Api::Responses {
+            bail!("[chatgpt] only speaks model.api = \"responses\"");
+        }
+        if provider == Provider::GithubCopilot && !matches!(api, Api::Openai | Api::Responses) {
+            bail!("[github-copilot] requires model.api = \"openai\" or \"responses\"");
         }
         let approval = match (file.approval.mode, file.approval.model) {
             (ApprovalMode::Ask, None) => Approval::Ask,
@@ -798,7 +806,7 @@ mod tests {
             assert!(config.api_key.as_str().is_empty());
         }
         let copilot =
-            Config::parse("[github-copilot]\n[model]\nname = \"claude-sonnet-4.6\"\n").unwrap();
+            Config::parse("[github-copilot]\n[model]\nname = \"claude-sonnet-5.5\"\n").unwrap();
         assert_eq!(
             copilot.api,
             Api::Openai,
@@ -806,6 +814,13 @@ mod tests {
         );
         let codex = Config::parse("[github-copilot]\n[model]\nname = \"gpt-5.3-codex\"\n").unwrap();
         assert_eq!(codex.api, Api::Responses);
+        let luna = Config::parse("[github-copilot]\n[model]\nname = \"gpt-6-luna\"\n").unwrap();
+        assert_eq!(luna.api, Api::Responses);
+        let custom = Config::parse(
+            "[github-copilot]\n[model]\nname = \"custom-model\"\napi = \"responses\"\n",
+        )
+        .unwrap();
+        assert_eq!(custom.api, Api::Responses);
     }
 
     #[test]
