@@ -28,6 +28,7 @@ use crate::fetch::{self, Fetcher};
 use crate::files;
 use crate::mcp::Mcp;
 use crate::memory;
+use crate::oauth;
 use crate::review::{self, Guard, Reviewer};
 use crate::sandbox;
 use crate::search;
@@ -104,8 +105,9 @@ type OpenaiModel = <openai::CompletionsClient as CompletionClient>::CompletionMo
 type ResponsesModel = <openai::Client as CompletionClient>::CompletionModel;
 type GeminiModel = <gemini::Client as CompletionClient>::CompletionModel;
 
-/// The configured model behind whichever OpenCode Go endpoint it speaks.
+/// The configured model behind its provider's wire format.
 pub(crate) enum Model {
+    OAuth(oauth::Model),
     Anthropic(AnthropicModel),
     Openai(OpenaiModel),
     Responses(ResponsesModel),
@@ -115,6 +117,9 @@ pub(crate) enum Model {
 impl Model {
     /// `session` goes out as `x-opencode-session` so OpenCode Go can route and cache per conversation.
     fn new(config: &Config, session: &str) -> Result<Self> {
+        if config.provider.uses_oauth() {
+            return Ok(Self::OAuth(oauth::Model::new(config)?));
+        }
         let mut headers = HeaderMap::new();
         if config.provider == Provider::OpencodeGo {
             headers.insert(
@@ -186,6 +191,7 @@ impl Model {
         request: CompletionRequest,
     ) -> Result<CompletionResponse, CompletionError> {
         match self {
+            Self::OAuth(model) => model.complete(request).await,
             Self::Anthropic(model) => model.completion(request).await,
             Self::Openai(model) => model.completion(request).await,
             Self::Responses(model) => {
@@ -279,6 +285,7 @@ impl Reviewer for Review {
 impl std::fmt::Debug for Model {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::OAuth(_) => "Model::OAuth",
             Self::Anthropic(_) => "Model::Anthropic",
             Self::Openai(_) => "Model::Openai",
             Self::Responses(_) => "Model::Responses",
@@ -803,10 +810,13 @@ impl Agent {
             Ok(text) => text,
             Err(err) => return Ok(format!("error: cannot read {}: {err}", path.display())),
         };
-        let (text, fresh) = match settings::edit(&text, key, &args["value"]) {
+        let (text, mut fresh) = match settings::edit(&text, key, &args["value"]) {
             Ok(edited) => edited,
             Err(err) => return Ok(format!("error: {err:#}")),
         };
+        // In-memory parsing has no file path. OAuth client lookup and later reloads
+        // must keep using this conversation's original config directory.
+        fresh.path = path.clone();
         let value = args["value"].to_string();
         if !io
             .confirm(&format!("set {key} = {value} in {}", path.display()))
@@ -1287,6 +1297,52 @@ mod tests {
             .expect("a stop wakes the running turn");
     }
 
+    #[tokio::test]
+    async fn a_settings_change_preserves_the_config_path_for_later_requests() {
+        crate::install_tls_provider();
+        struct Approve;
+        impl Io for Approve {
+            async fn say(&mut self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn confirm(&mut self, _: &str) -> Result<bool> {
+                Ok(true)
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "mokuzu-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[opencode-go]\napi_key = \"unused\"\n").unwrap();
+        let config = Config::load(&path).unwrap();
+        let db = Db::open(&dir.join("test.db")).unwrap();
+        let mcp = Arc::new(Mcp::connect(&std::collections::BTreeMap::new(), None).await);
+        let mut agent = Agent::new(config, db, mcp, "settings-test").await.unwrap();
+        agent
+            .settings(
+                &serde_json::json!({"action": "set", "key": "model.max_tokens", "value": 2000}),
+                &mut Approve,
+            )
+            .await
+            .unwrap();
+        assert_eq!(agent.config.path, path);
+        assert_eq!(agent.config.max_tokens, 2000);
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("max_tokens = 2000", "max_tokens = 3000");
+        std::fs::write(&path, text).unwrap();
+        agent.reload().unwrap();
+        assert_eq!(agent.config.max_tokens, 3000);
+        drop(agent);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn merge_users_folds_back_to_back_user_messages() {
         let merged = merge_users(&[
@@ -1374,11 +1430,13 @@ mod tests {
     }
 
     /// Prints what the agent says, approving nothing.
-    struct Print;
+    #[derive(Default)]
+    struct Print(Vec<String>);
 
     impl Io for Print {
         async fn say(&mut self, text: &str) -> Result<()> {
             println!("{text}");
+            self.0.push(text.to_owned());
             Ok(())
         }
         async fn confirm(&mut self, _action: &str) -> Result<bool> {
@@ -1391,9 +1449,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "sends several requests to the configured model"]
     async fn tool_round_trip_on_the_real_model() {
-        let path = std::env::home_dir()
-            .expect("home")
-            .join(".config/mokuzu/config.toml");
+        crate::install_tls_provider();
+        let path = std::env::var_os("MOKUZU_TEST_CONFIG")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::home_dir()
+                    .expect("home")
+                    .join(".config/mokuzu/config.toml")
+            });
         let loaded = Config::load(&path).expect("config loads");
         let model = std::env::var("MOKUZU_TEST_MODEL").unwrap_or(loaded.model.clone());
         let dir = std::env::temp_dir().join(format!("mokuzu-test-{}", std::process::id()));
@@ -1413,14 +1476,18 @@ mod tests {
             "I am Sam. Read {} and tell me the secret word.",
             file.display()
         );
+        let mut io = Print::default();
         agent
-            .run_turn(&prompt, Vec::new(), 1, &mut Print)
+            .run_turn(&prompt, Vec::new(), 1, &mut io)
             .await
             .expect("first turn");
+        assert!(io.0.join("\n").to_ascii_lowercase().contains("pelican"));
+        io.0.clear();
         agent
-            .run_turn("Spell it backwards.", Vec::new(), 1, &mut Print)
+            .run_turn("Spell it backwards.", Vec::new(), 1, &mut io)
             .await
             .expect("second turn");
+        assert!(io.0.join("\n").to_ascii_lowercase().contains("nacilep"));
     }
 
     #[test]

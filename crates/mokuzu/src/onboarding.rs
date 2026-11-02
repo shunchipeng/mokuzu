@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use ratatui::DefaultTerminal;
@@ -12,6 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListState, Padding, Paragraph, Wrap};
 
 use crate::config::{self, Api, Config, Provider};
+use crate::oauth;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table};
 
 /// Common OpenCode Go models; `config::Api::for_model` picks each one's endpoint format.
@@ -44,6 +47,10 @@ const ANTHROPIC_MODELS: &[&str] = &[
 ];
 const OPENCODE_GO: &str = "OpenCode Go";
 const ANTHROPIC: &str = "Anthropic";
+const GITHUB_COPILOT: &str = "GitHub Copilot (OAuth)";
+const CHATGPT: &str = "OpenAI ChatGPT (OAuth)";
+const COPILOT_MODELS: &[&str] = &["gpt-5.3-codex", "claude-sonnet-4.6"];
+const CHATGPT_MODELS: &[&str] = &["gpt-5.3-codex", "gpt-5.4"];
 const CUSTOM: &str = "Custom…";
 const ENABLED: &str = "Enabled";
 const DISABLED: &str = "Disabled";
@@ -156,6 +163,25 @@ const MCP_FIRST: usize = 44;
 
 /// Focus value for the Save button under the fields.
 const BUTTON: usize = usize::MAX;
+const LOGIN: usize = usize::MAX - 1;
+
+enum LoginUpdate {
+    Prompt { url: String, code: String },
+    Done(std::result::Result<(), String>),
+}
+
+struct Login {
+    provider: Provider,
+    updates: mpsc::Receiver<LoginUpdate>,
+    task: tokio::task::JoinHandle<()>,
+    prompt: Option<(String, String)>,
+}
+
+impl Drop for Login {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
 
 struct Form {
     fields: Vec<Field>,
@@ -176,12 +202,15 @@ struct Form {
     attempted: bool,
     /// `NO_COLOR` is set: draw without colors, relying on the ✓ ✗ ● ▌ marks.
     plain: bool,
+    login: Option<Login>,
 }
 
 fn models(provider: Provider) -> &'static [&'static str] {
     match provider {
         Provider::OpencodeGo => MODELS,
         Provider::Anthropic => ANTHROPIC_MODELS,
+        Provider::GithubCopilot => COPILOT_MODELS,
+        Provider::Chatgpt => CHATGPT_MODELS,
     }
 }
 
@@ -189,6 +218,8 @@ fn provider_name(provider: Provider) -> &'static str {
     match provider {
         Provider::OpencodeGo => OPENCODE_GO,
         Provider::Anthropic => ANTHROPIC,
+        Provider::GithubCopilot => GITHUB_COPILOT,
+        Provider::Chatgpt => CHATGPT,
     }
 }
 
@@ -236,7 +267,7 @@ impl Form {
             field(
                 STEP_MODEL,
                 "Provider",
-                Kind::Select(options(&[OPENCODE_GO, ANTHROPIC])),
+                Kind::Select(options(&[OPENCODE_GO, ANTHROPIC, GITHUB_COPILOT, CHATGPT])),
                 provider_name(provider).to_owned(),
             ),
             field(
@@ -577,6 +608,7 @@ impl Form {
                 .unwrap_or_default(),
             attempted: false,
             plain: std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
+            login: None,
         })
     }
 
@@ -601,6 +633,7 @@ impl Form {
                 MCP_URL | MCP_TOKEN => self.fields[MCP_ADD].value == HTTP,
                 REVIEWER => self.fields[APPROVAL].value == AUTO,
                 API => self.provider() == Provider::OpencodeGo,
+                KEY | BASE_URL => !self.provider().uses_oauth(),
                 _ => true,
             }
     }
@@ -609,6 +642,7 @@ impl Form {
     fn visible(&self) -> Vec<usize> {
         (0..self.fields.len())
             .filter(|&i| self.shown(i))
+            .chain((self.step == STEP_MODEL && self.provider().uses_oauth()).then_some(LOGIN))
             .chain([BUTTON])
             .collect()
     }
@@ -638,7 +672,11 @@ impl Form {
     /// Runs the event loop; `Some` once saved, `None` if the user quit.
     fn run(&mut self, terminal: &mut DefaultTerminal, path: &Path) -> Result<Option<Config>> {
         loop {
+            self.poll_login();
             terminal.draw(|frame| self.draw(frame))?;
+            if self.login.is_some() && !event::poll(Duration::from_millis(100))? {
+                continue;
+            }
             let Event::Key(key) = event::read()? else {
                 continue;
             };
@@ -647,6 +685,12 @@ impl Form {
             }
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 return Ok(None);
+            }
+            if self.login.is_some() {
+                if key.code == KeyCode::Esc {
+                    self.cancel_login();
+                }
+                continue;
             }
             if let Some(menu) = &mut self.menu {
                 let Kind::Select(values) = &self.fields[self.focus].kind else {
@@ -687,23 +731,32 @@ impl Form {
                         return Ok(Some(config));
                     }
                 }
+                KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if self.step == STEP_MODEL && self.provider().uses_oauth() {
+                        self.start_login(path);
+                    }
+                }
+                KeyCode::Enter if self.focus == LOGIN => self.start_login(path),
                 KeyCode::Enter if self.focus == BUTTON => {
                     if let Some(config) = self.save(path)? {
                         return Ok(Some(config));
                     }
                 }
                 KeyCode::Enter | KeyCode::Char(' ')
-                    if matches!(self.fields[self.focus].kind, Kind::Select(_)) =>
+                    if self
+                        .fields
+                        .get(self.focus)
+                        .is_some_and(|field| matches!(field.kind, Kind::Select(_))) =>
                 {
                     self.open_menu();
                 }
                 KeyCode::Enter => self.move_focus(1),
-                KeyCode::Backspace if self.focus != BUTTON => {
+                KeyCode::Backspace if self.focus < self.fields.len() => {
                     self.fields[self.focus].value.pop();
                     self.edited();
                 }
                 KeyCode::Char(c)
-                    if self.focus != BUTTON
+                    if self.focus < self.fields.len()
                         && !matches!(self.fields[self.focus].kind, Kind::Select(_)) =>
                 {
                     self.fields[self.focus].value.push(c);
@@ -714,12 +767,73 @@ impl Form {
         }
     }
 
+    fn start_login(&mut self, path: &Path) {
+        let provider = self.provider();
+        let path = path.to_owned();
+        let (sender, updates) = mpsc::channel();
+        let task = tokio::runtime::Handle::current().spawn(async move {
+            let prompts = sender.clone();
+            let result = oauth::login_with_prompt(&path, provider, move |url, code| {
+                let _ = prompts.send(LoginUpdate::Prompt { url, code });
+            })
+            .await
+            .map_err(|err| format!("{err:#}"));
+            let _ = sender.send(LoginUpdate::Done(result));
+        });
+        self.login = Some(Login {
+            provider,
+            updates,
+            task,
+            prompt: None,
+        });
+    }
+
+    fn cancel_login(&mut self) {
+        self.login = None;
+        self.status = Line::from("Sign-in cancelled; settings kept.").yellow();
+    }
+
+    fn poll_login(&mut self) {
+        let mut done = None;
+        if let Some(login) = &mut self.login {
+            loop {
+                match login.updates.try_recv() {
+                    Ok(LoginUpdate::Prompt { url, code }) => login.prompt = Some((url, code)),
+                    Ok(LoginUpdate::Done(result)) => {
+                        done = Some((login.provider, result));
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        done = Some((
+                            login.provider,
+                            Err("sign-in task ended unexpectedly".to_owned()),
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some((provider, result)) = done {
+            self.login = None;
+            self.status = match result {
+                Ok(()) => Line::from(format!(
+                    "✓ Signed in to {}. Save to keep your settings.",
+                    provider_name(provider)
+                ))
+                .green(),
+                Err(err) => Line::from(format!("✗ {err}")).red(),
+            };
+        }
+    }
+
     /// Any edit clears a previous save error.
     fn provider(&self) -> Provider {
-        if self.fields[PROVIDER].value == ANTHROPIC {
-            Provider::Anthropic
-        } else {
-            Provider::OpencodeGo
+        match self.fields[PROVIDER].value.as_str() {
+            ANTHROPIC => Provider::Anthropic,
+            GITHUB_COPILOT => Provider::GithubCopilot,
+            CHATGPT => Provider::Chatgpt,
+            _ => Provider::OpencodeGo,
         }
     }
 
@@ -800,7 +914,9 @@ impl Form {
                 self.discord()?;
             }
             STEP_MODEL => {
-                self.required(KEY)?;
+                if !self.provider().uses_oauth() {
+                    self.required(KEY)?;
+                }
                 self.model()?;
             }
             STEP_VOICE => {
@@ -837,7 +953,7 @@ impl Form {
         let provider = self.provider();
         let api = match self.value(API) {
             // Anthropic speaks only its own format.
-            api if api == API_AUTO || provider == Provider::Anthropic => {
+            api if api == API_AUTO || provider != Provider::OpencodeGo => {
                 provider.api_for(&self.model()?).name().to_owned()
             }
             api => api,
@@ -1058,7 +1174,11 @@ impl Form {
     fn answers(&self) -> std::result::Result<Answers, String> {
         Ok(Answers {
             provider: self.provider(),
-            api_key: self.required(KEY)?,
+            api_key: if self.provider().uses_oauth() {
+                String::new()
+            } else {
+                self.required(KEY)?
+            },
             model: self.model()?,
             discord: self.discord()?,
             voice: self.voice()?,
@@ -1078,7 +1198,7 @@ impl Form {
             other_keys: self
                 .keys
                 .iter()
-                .filter(|(_, (key, _))| !key.trim().is_empty())
+                .filter(|(provider, (key, _))| provider.uses_oauth() || !key.trim().is_empty())
                 .map(|(&provider, (key, url))| {
                     let url = if url.is_empty() {
                         provider.default_base_url().to_owned()
@@ -1154,6 +1274,15 @@ impl Form {
         let mut menu_anchor = None;
         for (row, &i) in rows.iter().enumerate() {
             let focused = i == self.focus;
+            if i == LOGIN {
+                let button = " Sign in… (^L) ";
+                lines.push(Line::from(if focused {
+                    button.black().on_cyan().bold()
+                } else {
+                    button.cyan()
+                }));
+                continue;
+            }
             if i == BUTTON {
                 lines.push(Line::default());
                 let button = if focused {
@@ -1228,6 +1357,11 @@ impl Form {
                 let (about, warning) = help(self.focus);
                 (field.label.as_str(), about, warning)
             }
+            None if self.focus == LOGIN => (
+                "OAuth sign-in",
+                "Start browser authorization. The verification URL and one-time code appear here; Esc cancels while keeping your settings.",
+                "",
+            ),
             None => (
                 "Save",
                 "Tests the connection to the model, then writes the config. ^S saves from any field.",
@@ -1254,6 +1388,8 @@ impl Form {
         frame.render_widget(Paragraph::new(self.status.clone()), status);
         let keys_text = if self.menu.is_some() {
             " ↑↓ choose  Enter select  Esc close"
+        } else if self.step == STEP_MODEL && self.provider().uses_oauth() {
+            " ←→ step  ↑↓ field  ^L sign in  ^S save  Esc back  ^C quit"
         } else {
             " ←→ step  ↑↓ field  Enter open/next  ^R show secrets  ^S save  Esc back  ^C quit"
         };
@@ -1271,6 +1407,34 @@ impl Form {
                 .highlight_symbol("› ");
             frame.render_widget(Clear, area);
             frame.render_stateful_widget(list, area, menu);
+        }
+        if let Some(login) = &self.login {
+            let area = centered(frame.area(), 72, 11);
+            let mut lines = vec![
+                Line::from(provider_name(login.provider)).bold(),
+                Line::default(),
+            ];
+            match &login.prompt {
+                Some((url, code)) => {
+                    lines.push(Line::from("Open this URL in your browser:"));
+                    lines.push(Line::from(url.clone()).cyan());
+                    lines.push(Line::from(format!("One-time code: {code}")).bold());
+                    lines.push(Line::from("Waiting for browser authorization…"));
+                }
+                None => lines.push(Line::from("Starting sign-in…")),
+            }
+            lines.push(Line::default());
+            lines.push(Line::from("Esc cancels · settings are kept"));
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .title(" OAuth sign-in ")
+                        .padding(Padding::horizontal(1)),
+                ),
+                area,
+            );
         }
         if self.plain {
             for cell in frame.buffer_mut().content.iter_mut() {
@@ -1433,8 +1597,9 @@ fn help(i: usize) -> (&'static str, &'static str) {
              internet need a tunnel in front of it. Takes effect when mokuzu next starts."
         }
         PROVIDER => {
-            "Where Mokuzu's model runs: OpenCode Go, or Anthropic's API for Claude with an \
-             Anthropic API key. Each keeps its own API key, so switching back finds it again."
+            "OpenCode Go and Anthropic use API keys. For GitHub Copilot or OpenAI ChatGPT, \
+             choose Sign in… or press ^L to authorize in your browser. OAuth credentials \
+             stay separate from API keys and from other providers."
         }
         _ => "Keep it, or Remove it.",
     };
@@ -1447,6 +1612,18 @@ fn help(i: usize) -> (&'static str, &'static str) {
         _ => "",
     };
     (about, warning)
+}
+
+/// Centers the authorization dialog, including in small terminals.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    )
 }
 
 /// Places the dropdown just under field row `row`, aligned with the value column.
@@ -2012,6 +2189,45 @@ mod tests {
     }
 
     #[test]
+    fn oauth_provider_switches_round_trip_without_keys_or_leaking_an_api_key() {
+        let mut form = Form::new(None).unwrap();
+        form.fields[TOKEN].value = "discord-token".to_owned();
+        form.fields[USERS].value = "1".to_owned();
+        form.fields[KEY].value = "opencode-key".to_owned();
+        form.fields[PROVIDER].value = GITHUB_COPILOT.to_owned();
+        form.switch_provider(Provider::OpencodeGo);
+        form.step = STEP_MODEL;
+        form.check_step(STEP_MODEL).unwrap();
+        assert!(!form.visible().contains(&KEY));
+        assert!(form.value(KEY).is_empty());
+        assert_eq!(form.model_options().unwrap().api, "responses");
+        form.fields[PROVIDER].value = CHATGPT.to_owned();
+        form.switch_provider(Provider::GithubCopilot);
+        form.check_step(STEP_MODEL).unwrap();
+        let text = render_toml(&form.answers().unwrap());
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.provider, Provider::Chatgpt);
+        assert!(config.api_key.as_str().is_empty());
+        assert!(
+            config
+                .keys
+                .iter()
+                .any(|(p, _)| *p == Provider::GithubCopilot)
+        );
+        let mut reopened = Form::new(Some(&config)).unwrap();
+        assert_eq!(reopened.value(PROVIDER), CHATGPT);
+        reopened.fields[PROVIDER].value = OPENCODE_GO.to_owned();
+        reopened.switch_provider(Provider::Chatgpt);
+        assert_eq!(reopened.value(KEY), "opencode-key");
+        reopened.fields[PROVIDER].value = GITHUB_COPILOT.to_owned();
+        reopened.switch_provider(Provider::OpencodeGo);
+        assert_eq!(reopened.value(MODEL), COPILOT_MODELS[0]);
+        assert!(reopened.value(KEY).is_empty());
+        let config = Config::parse(&render_toml(&reopened.answers().unwrap())).unwrap();
+        assert_eq!(config.provider, Provider::GithubCopilot);
+    }
+
+    #[test]
     fn steps_validate_and_hide_conditional_fields() {
         let mut form = Form::new(None).expect("form");
         assert_eq!(form.step, STEP_DISCORD, "the bot comes first");
@@ -2152,6 +2368,66 @@ mod tests {
             "dropdown lists models:\n{screen}"
         );
         assert!(!screen.contains("sk-secret"));
+    }
+
+    #[tokio::test]
+    async fn oauth_dialog_displays_device_code_and_returns_to_the_form_after_success() {
+        let mut form = Form::new(None).unwrap();
+        form.fields[PROVIDER].value = CHATGPT.to_owned();
+        form.switch_provider(Provider::OpencodeGo);
+        form.step = STEP_MODEL;
+        form.focus = LOGIN;
+        assert!(form.visible().contains(&LOGIN));
+        let (sender, updates) = mpsc::channel();
+        form.login = Some(Login {
+            provider: Provider::Chatgpt,
+            updates,
+            task: tokio::spawn(std::future::pending()),
+            prompt: None,
+        });
+        sender
+            .send(LoginUpdate::Prompt {
+                url: "https://auth.openai.com/codex/device".to_owned(),
+                code: "TEST-1234".to_owned(),
+            })
+            .unwrap();
+        form.poll_login();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| form.draw(frame)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        assert!(screen.contains("OAuth sign-in"));
+        assert!(screen.contains("https://auth.openai.com/codex/device"));
+        assert!(screen.contains("TEST-1234"));
+        sender.send(LoginUpdate::Done(Ok(()))).unwrap();
+        form.poll_login();
+        assert!(form.login.is_none());
+        assert!(form.status.to_string().contains("Signed in"));
+        assert_eq!(form.provider(), Provider::Chatgpt);
+        assert_eq!(form.value(MODEL), CHATGPT_MODELS[0]);
+        terminal.draw(|frame| form.draw(frame)).unwrap();
+        assert!(!format!("{}", terminal.backend()).contains("TEST-1234"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_oauth_aborts_polling_without_discarding_settings() {
+        let mut form = Form::new(None).unwrap();
+        form.fields[TOKEN].value = "unsaved-discord-token".to_owned();
+        let (_sender, updates) = mpsc::channel();
+        let task = tokio::spawn(std::future::pending());
+        let abort = task.abort_handle();
+        form.login = Some(Login {
+            provider: Provider::GithubCopilot,
+            updates,
+            task,
+            prompt: None,
+        });
+        form.cancel_login();
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished());
+        assert!(form.login.is_none());
+        assert_eq!(form.value(TOKEN), "unsaved-discord-token");
+        assert!(form.status.to_string().contains("cancelled"));
     }
 
     #[test]

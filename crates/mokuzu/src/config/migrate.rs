@@ -48,7 +48,7 @@ pub fn migrate(text: &str) -> Result<Option<String>> {
 /// `[tools.bash]` and `[tools.claude_code]`. Values it cannot place (no provider section) are
 /// left for `parse` to report.
 fn spell_out_defaults(doc: &mut DocumentMut) -> Result<()> {
-    let present: Vec<Provider> = [Provider::OpencodeGo, Provider::Anthropic]
+    let present: Vec<Provider> = Provider::ALL
         .into_iter()
         .filter(|provider| doc.contains_key(provider.section()))
         .collect();
@@ -66,6 +66,8 @@ fn spell_out_defaults(doc: &mut DocumentMut) -> Result<()> {
     let provider = match model.get("provider").and_then(Item::as_str) {
         Some("anthropic") => Some(Provider::Anthropic),
         Some("opencode-go") => Some(Provider::OpencodeGo),
+        Some("github-copilot") => Some(Provider::GithubCopilot),
+        Some("chatgpt") => Some(Provider::Chatgpt),
         _ => None,
     };
     if let Some(provider) = provider {

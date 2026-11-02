@@ -13,13 +13,14 @@ timezone = "Asia/Taipei"
 # Any model your provider serves. OpenCode Go: e.g. minimax-m3, qwen3.8-max, glm-5.3, kimi-k3,
 # deepseek-v4-pro. Anthropic: e.g. claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5.
 name = "minimax-m3"
-# Which provider section below is in use: "opencode-go" or "anthropic". Each keeps its own key,
-# so you can keep both and switch here.
+# Which provider section below is in use: "opencode-go", "anthropic", "github-copilot", or
+# "chatgpt". Each keeps its own credentials, so you can keep them and switch here.
 provider = "opencode-go"
 # Endpoint format. "anthropic" (/messages), "openai" (/chat/completions), "responses"
 # (/responses), or "gemini" (generateContent). On OpenCode Go: minimax*/qwen*/claude* use
 # anthropic, gpt*/grok*/muse* responses, gemini* gemini, and everything else openai. Anthropic
-# speaks only "anthropic".
+# speaks only "anthropic". Copilot uses "responses" for model IDs containing "codex" and
+# "openai" for others (including Claude); ChatGPT uses only "responses".
 api = "anthropic"
 max_tokens = 16000
 # When the conversation grows past about this many tokens, long tool output in older turns is
@@ -36,6 +37,13 @@ base_url = "https://opencode.ai/zen/go/v1"
 # [anthropic]
 # api_key = "sk-ant-..."
 # base_url = "https://api.anthropic.com/v1"
+
+# Subscription OAuth: run `mokuzu login github-copilot` or `mokuzu login chatgpt`, then select
+# the matching model.provider and model.api above. No api_key; endpoints are fixed.
+# Example Copilot model: "gpt-5.3-codex" (api = "responses"), or "claude-sonnet-4.6" ("openai").
+# [github-copilot]
+# Example ChatGPT model: "gpt-5.3-codex" (api = "responses").
+# [chatgpt]
 
 # How MCP calls and settings changes get approved. "ask" asks you every time; "auto" lets the
 # reviewer `model` pass low-risk actions and asks you about the rest.

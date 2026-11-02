@@ -15,7 +15,8 @@ Mokuzu is an open-source personal AI assistant that runs on your own machine, su
 Raspberry Pi, and talks with you as a Discord bot, in text and in voice channels. It reads files
 and web pages, searches the web, remembers what you tell it, calls tools on MCP servers such as
 Linear or GitHub, runs code in a sandbox, and runs scheduled jobs and webhooks. It works with
-Claude through the Anthropic API, or with the models on OpenCode Go. It is one Rust binary.
+Claude through the Anthropic API, the models on OpenCode Go, or GitHub Copilot and OpenAI
+ChatGPT subscriptions through OAuth. It is one Rust binary.
 
 Mokuzu's own tools only read, except that it can write files, and run code in a sandbox, in its
 own workspace folder.
@@ -94,10 +95,50 @@ mokuzu install     # run the Discord bot in the background
 
 `mokuzu configure` writes `~/.config/mokuzu/config.toml`. Its **Discord** page takes the bot token
 and your user ID (see [Discord](#discord)), and its **Model** page your provider, API key, and
-model: OpenCode Go, or Anthropic's API for Claude with an Anthropic API key. Each provider keeps
-its own key, so switching between them never reuses one. Those two pages are required; voice
+model: OpenCode Go or Anthropic with an API key, or GitHub Copilot or OpenAI ChatGPT with OAuth
+(see below). Each provider keeps its own credentials, so switching between them never reuses
+another provider's key. Those two pages are required; voice
 calls, web search, MCP servers, and the rest are optional. `mokuzu` alone runs the bot in the
 foreground, as `mokuzu serve` does.
+
+### GitHub Copilot and OpenAI ChatGPT OAuth
+
+On the **Model** page of `mokuzu configure`, select **GitHub Copilot (OAuth)** or
+**OpenAI ChatGPT (OAuth)** and choose **Sign in…** (or press **Ctrl+L**). The setup screen
+shows the verification URL and one-time code while you authorize in your browser. It returns
+to the form when sign-in succeeds; **Esc** cancels sign-in and keeps your unsaved settings.
+No API key is needed for these two providers.
+
+You can also sign in from the command line before configuring the bot:
+
+```sh
+mokuzu login github-copilot   # GitHub Copilot (OAuth)
+mokuzu login chatgpt          # OpenAI ChatGPT (OAuth); `login openai` is an alias
+mokuzu configure
+mokuzu install
+```
+
+Each login prints a verification URL and a one-time code. Open that URL in your browser and
+authorize your account. ChatGPT may require enabling device code authorization in its security
+settings. You need a subscription and access to the selected model; the preset list is a
+starting point, and **Custom…** accepts other model IDs your account can use.
+
+These integrations use the Copilot API and the ChatGPT Codex subscription backend through
+[Rig's built-in providers](https://docs.rs/rig-core/0.42.0/rig_core/providers/index.html).
+Rig handles device-code polling, cached access tokens, and token renewal. Copilot chooses Chat
+Completions or Responses for each model; ChatGPT uses Responses with streaming and no server
+storage. Mokuzu continues to execute tools through its own approval and sandbox mechanisms.
+Voice still needs its separate OpenAI API key.
+
+Credentials are kept in `oauth/github-copilot/` and `oauth/chatgpt/` beside the selected config
+file, with directories readable only by the owner (`0700`) and credential files `0600`.
+For a separate config, use the same `--config /path/to/config.toml` for login, configure, and
+serve. Use separate config directories for separate accounts or bot instances.
+The background service never starts an interactive login; if authorization expires or
+is revoked, run the corresponding `mokuzu login` command again.
+Only one process may own a provider's credential directory at a time, so rotating refresh
+tokens cannot race. Stop the running bot before signing in again; `mokuzu uninstall`, login,
+then `mokuzu install` also does this using Mokuzu's service commands.
 
 ## Discord
 
@@ -282,7 +323,8 @@ OS. Other platforms build from source with `cargo install`.
 
 ### Which LLMs does it work with?
 
-Claude through an Anthropic API key, or the models on OpenCode Go, chosen in `mokuzu configure`.
+Claude through an Anthropic API key, the models on OpenCode Go, or models available to your
+GitHub Copilot or OpenAI ChatGPT subscription, chosen in `mokuzu configure`.
 Voice calls and voice message transcripts also need an OpenAI API key.
 
 ### Does it work outside Discord?
@@ -306,6 +348,14 @@ it uses.
 cargo test                    # unit tests
 cargo test -- --ignored       # also the tests that call real services (npx, your model)
 cargo clippy --all-targets -- -D warnings
+```
+
+To test an OAuth provider against its live service with a separate config, sign in using
+that same config path and run the existing tool and follow-up conversation check:
+
+```sh
+cargo run -- --config /path/to/test-config.toml login github-copilot  # or chatgpt
+MOKUZU_TEST_CONFIG=/path/to/test-config.toml cargo test -- --ignored tool_round_trip_on_the_real_model
 ```
 
 Pushing a `v*` tag that matches the version in `crates/mokuzu/Cargo.toml` builds every platform

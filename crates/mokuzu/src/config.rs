@@ -1,4 +1,4 @@
-//! TOML config file: the model and its provider's key (OpenCode Go or Anthropic), tools, MCP servers, logging, storage, and Discord.
+//! TOML config file: the model's provider (API key or OAuth), tools, MCP servers, logging, storage, and Discord.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -78,22 +78,39 @@ impl Api {
     }
 }
 
-/// Who serves the model: the config's `[opencode-go]` or `[anthropic]` section.
+/// Who serves the model, with a separate config section for each provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Provider {
     OpencodeGo,
     /// Anthropic's own API, which speaks only the Anthropic format.
     Anthropic,
+    /// GitHub Copilot subscription, authenticated with device OAuth.
+    GithubCopilot,
+    /// OpenAI's ChatGPT subscription, through Rig's Codex OAuth provider.
+    Chatgpt,
 }
 
 impl Provider {
-    /// The format `model` speaks here: always Anthropic's on Anthropic, guessed from the name on
-    /// OpenCode Go.
+    pub const ALL: [Self; 4] = [
+        Self::OpencodeGo,
+        Self::Anthropic,
+        Self::GithubCopilot,
+        Self::Chatgpt,
+    ];
+
+    pub fn uses_oauth(self) -> bool {
+        matches!(self, Self::GithubCopilot | Self::Chatgpt)
+    }
+
+    /// The format `model` speaks here. Copilot's model routing matches Rig's provider.
     pub fn api_for(self, model: &str) -> Api {
         match self {
             Self::OpencodeGo => Api::for_model(model),
             Self::Anthropic => Api::Anthropic,
+            Self::GithubCopilot if model.to_ascii_lowercase().contains("codex") => Api::Responses,
+            Self::GithubCopilot => Api::Openai,
+            Self::Chatgpt => Api::Responses,
         }
     }
 
@@ -102,6 +119,8 @@ impl Provider {
         match self {
             Self::OpencodeGo => "opencode-go",
             Self::Anthropic => "anthropic",
+            Self::GithubCopilot => "github-copilot",
+            Self::Chatgpt => "chatgpt",
         }
     }
 
@@ -109,6 +128,8 @@ impl Provider {
         match self {
             Self::OpencodeGo => DEFAULT_BASE_URL,
             Self::Anthropic => ANTHROPIC_BASE_URL,
+            Self::GithubCopilot => "https://api.githubcopilot.com",
+            Self::Chatgpt => "https://chatgpt.com/backend-api/codex",
         }
     }
 
@@ -116,6 +137,8 @@ impl Provider {
         match self {
             Self::OpencodeGo => "minimax-m3",
             Self::Anthropic => "claude-opus-5-5",
+            Self::GithubCopilot => "gpt-5.3-codex",
+            Self::Chatgpt => "gpt-5.3-codex",
         }
     }
 }
@@ -128,7 +151,7 @@ pub struct ProviderKey {
 }
 
 /// API key or token whose `Debug` output is redacted.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(String);
 
@@ -156,6 +179,9 @@ struct File {
     #[serde(rename = "opencode-go")]
     opencode_go: Option<ProviderSection>,
     anthropic: Option<ProviderSection>,
+    #[serde(rename = "github-copilot")]
+    github_copilot: Option<ProviderSection>,
+    chatgpt: Option<ProviderSection>,
     #[serde(default)]
     tools: ToolsSection,
     #[serde(default)]
@@ -206,12 +232,12 @@ struct ModelSection {
     compact_at_tokens: usize,
 }
 
-/// `[opencode-go]` or `[anthropic]`: the provider's key, and a base URL to reach it through.
+/// A provider's key and endpoint. OAuth providers leave the key empty and use their fixed endpoint.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderSection {
-    api_key: Secret,
-    base_url: String,
+    api_key: Option<Secret>,
+    base_url: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -587,22 +613,44 @@ impl Config {
         {
             bail!("discord.allowed_users is empty; list your Discord user ID");
         }
-        let keys: Vec<(Provider, ProviderKey)> = [
+        let mut keys = Vec::new();
+        for (provider, section) in [
             (Provider::OpencodeGo, file.opencode_go),
             (Provider::Anthropic, file.anthropic),
-        ]
-        .into_iter()
-        .filter_map(|(provider, section)| {
-            let section = section?;
-            let key = ProviderKey {
-                api_key: section.api_key,
-                base_url: section.base_url.trim_end_matches('/').to_owned(),
+            (Provider::GithubCopilot, file.github_copilot),
+            (Provider::Chatgpt, file.chatgpt),
+        ] {
+            let Some(section) = section else { continue };
+            let api_key = match section.api_key {
+                Some(key) => key,
+                None if provider.uses_oauth() => Secret::default(),
+                None => bail!("[{}] requires api_key", provider.section()),
             };
-            Some((provider, key))
-        })
-        .collect();
+            let base_url = match section.base_url {
+                Some(url) => url,
+                None if provider.uses_oauth() => provider.default_base_url().to_owned(),
+                None => bail!("[{}] requires base_url", provider.section()),
+            };
+            let key = ProviderKey {
+                api_key,
+                base_url: base_url.trim_end_matches('/').to_owned(),
+            };
+            keys.push((provider, key));
+        }
         if keys.is_empty() {
-            bail!("add [opencode-go] or [anthropic] with your api_key");
+            bail!(
+                "add a model provider section: [opencode-go], [anthropic], [github-copilot], or [chatgpt]"
+            );
+        }
+        for (provider, key) in &keys {
+            if provider.uses_oauth()
+                && (!key.api_key.as_str().is_empty() || key.base_url != provider.default_base_url())
+            {
+                bail!(
+                    "[{}] uses OAuth and its built-in endpoint; omit api_key and base_url overrides",
+                    provider.section()
+                );
+            }
         }
         let provider = file.model.provider;
         let ProviderKey { api_key, base_url } = keys
@@ -651,6 +699,13 @@ impl Config {
         let api = file.model.api;
         if provider == Provider::Anthropic && api != Api::Anthropic {
             bail!("[anthropic] only speaks model.api = \"anthropic\"");
+        }
+        if provider.uses_oauth() && api != provider.api_for(&model) {
+            bail!(
+                "[{}] requires model.api = {:?} for this model",
+                provider.section(),
+                provider.api_for(&model).name()
+            );
         }
         let approval = match (file.approval.mode, file.approval.model) {
             (ApprovalMode::Ask, None) => Approval::Ask,
@@ -731,6 +786,61 @@ pub fn write(path: &Path, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_sections_need_no_api_key_and_use_their_own_wire_formats() {
+        for provider in [Provider::GithubCopilot, Provider::Chatgpt] {
+            let config =
+                Config::parse(&format!("[{}]\n", provider.section())).expect("OAuth config");
+            assert_eq!(config.provider, provider);
+            assert_eq!(config.api, provider.api_for(&config.model));
+            assert_eq!(config.base_url, provider.default_base_url());
+            assert!(config.api_key.as_str().is_empty());
+        }
+        let copilot =
+            Config::parse("[github-copilot]\n[model]\nname = \"claude-sonnet-4.6\"\n").unwrap();
+        assert_eq!(
+            copilot.api,
+            Api::Openai,
+            "Copilot serves Claude as chat completions"
+        );
+        let codex = Config::parse("[github-copilot]\n[model]\nname = \"gpt-5.3-codex\"\n").unwrap();
+        assert_eq!(codex.api, Api::Responses);
+    }
+
+    #[test]
+    fn oauth_rejects_api_keys_endpoint_overrides_and_incompatible_wire_formats() {
+        for section in ["github-copilot", "chatgpt"] {
+            assert!(
+                Config::parse(&format!("[{section}]\napi_key = \"not-an-oauth-login\"\n")).is_err()
+            );
+            assert!(
+                Config::parse(&format!(
+                    "[{section}]\nbase_url = \"https://other.example\"\n"
+                ))
+                .is_err()
+            );
+            assert!(
+                Config::parse(&format!("[{section}]\n[model]\napi = \"anthropic\"\n")).is_err()
+            );
+        }
+        let config = Config::parse(
+            "[model]\nprovider = \"chatgpt\"\n[chatgpt]\n[anthropic]\napi_key = \"keep-me\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.provider, Provider::Chatgpt);
+        assert_eq!(
+            config
+                .keys
+                .iter()
+                .find(|(p, _)| *p == Provider::Anthropic)
+                .unwrap()
+                .1
+                .api_key
+                .as_str(),
+            "keep-me"
+        );
+    }
 
     #[test]
     fn example_config_parses() {

@@ -11,6 +11,7 @@ mod files;
 mod legacy;
 mod mcp;
 mod memory;
+mod oauth;
 mod onboarding;
 mod review;
 mod sandbox;
@@ -30,10 +31,11 @@ use anyhow::{Context, Result, bail};
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str =
-    "usage: mokuzu [serve|configure|install|uninstall|update|restart] [--config PATH] [--version]
+    "usage: mokuzu [serve|configure|install|uninstall|update|restart|login PROVIDER] [--config PATH] [--version]
 
   serve      run the Discord bot (default)
   configure  interactive setup: Discord, model, voice, tools
+  login      device OAuth login: github-copilot or chatgpt (OpenAI)
   install    run `mokuzu serve` in the background and keep it alive (launchd or systemd)
   uninstall  remove the background service
   update     install the latest release and restart the background service
@@ -44,6 +46,7 @@ async fn main() -> Result<()> {
     install_tls_provider();
     let mut command = None;
     let mut config_path = None;
+    let mut login_provider = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
@@ -59,8 +62,18 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             Some(
-                name @ ("serve" | "configure" | "install" | "uninstall" | "update" | "restart"),
+                name @ ("serve" | "configure" | "install" | "uninstall" | "update" | "restart"
+                | "login"),
             ) if command.is_none() => command = Some(name.to_owned()),
+            Some(name @ ("github-copilot" | "chatgpt" | "openai"))
+                if command.as_deref() == Some("login") && login_provider.is_none() =>
+            {
+                login_provider = Some(if name == "github-copilot" {
+                    config::Provider::GithubCopilot
+                } else {
+                    config::Provider::Chatgpt
+                });
+            }
             _ => bail!("unexpected argument {arg:?}\n\n{USAGE}"),
         }
     }
@@ -83,6 +96,12 @@ async fn main() -> Result<()> {
         config_path,
         matches!(command.as_deref(), None | Some("serve")),
     )?;
+
+    if command.as_deref() == Some("login") {
+        let provider =
+            login_provider.context("login needs a provider: github-copilot or chatgpt")?;
+        return oauth::login(&config_path, provider).await;
+    }
 
     if command.as_deref() == Some("configure") {
         onboarding::run(&config_path).await?;
