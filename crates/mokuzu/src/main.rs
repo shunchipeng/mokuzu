@@ -13,6 +13,7 @@ mod mcp;
 mod memory;
 mod onboarding;
 mod review;
+mod sandbox;
 mod search;
 mod service;
 mod settings;

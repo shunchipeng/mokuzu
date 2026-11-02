@@ -99,6 +99,7 @@ pub async fn serve(config: Config) -> Result<()> {
     if config.voice.is_some() {
         intents |= GatewayIntents::GUILD_VOICE_STATES;
     }
+    crate::sandbox::probe().await;
     let display = crate::browser::desktop(config.browser_screen).await;
     let mcp = Arc::new(Mcp::connect(&config.mcp, display.as_deref()).await);
     let token = discord.token.as_str().to_owned();

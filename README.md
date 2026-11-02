@@ -11,7 +11,8 @@ servers such as Linear, and runs scheduled jobs.
 The name is モクズ (mokuzu), from モクズガニ, the Japanese mitten crab; its hairy claws look like
 they hold a tuft of seaweed scraps (藻屑).
 
-Mokuzu's own tools only read, except that it can write files in its own workspace folder.
+Mokuzu's own tools only read, except that it can write files, and run code in a sandbox, in its
+own workspace folder.
 Anything else that changes something (an MCP call or a settings change) asks you first, or goes
 past a reviewer model in auto mode.
 
@@ -151,6 +152,7 @@ Logs:
 | `fetch_url` | Reads a web page as text, or a linked PDF, `.docx`, or `.pptx` document up to 20 MB; a PDF's first 3 pages also come as images. Private network addresses are refused. | No |
 | `view_pdf` | Shows the model pages of a local or linked PDF as images, up to 10 per call, for layout, tables, figures, and scans that the text misses. Same path and address rules as `read_file` and `fetch_url`. | No |
 | `write_file` | Writes or appends to a text file in mokuzu's workspace (`workspace/` next to the database), the only place it can write; `read_file`, `list_dir`, and `send_file` reach it too, so it can hand you a CSV or report it made. | No |
+| `run_code` | Runs Python 3 or shell code in a [bubblewrap](https://github.com/containers/bubblewrap) sandbox, for calculations, data analysis, file conversion, and charts. The sandbox sees the system's programs read-only, writes only to the workspace, and has no network and no view of your home folder or other processes; runs are killed after 60 seconds (up to 10 minutes if the model asks), and limited to 4 GB of memory. Python packages must be installed system-wide (e.g. `apt install python3-pandas python3-matplotlib`). Linux only: offered when `bwrap` is installed (`apt install bubblewrap`) and can make a sandbox, checked when `mokuzu serve` starts. | No |
 | `send_file` | Sends a local file or a downloaded one (under 3 MB) as an attachment, e.g. an image the user asked to see. Same path and address rules as `read_file` and `fetch_url`. | No |
 | `web_search` | Searches through your SearXNG instance or the Brave Search API (pick one in `mokuzu configure`), optionally only recent results (`time_range`), news sites (`category`), or a date span (`after`, `before`; on SearXNG only Google engines honor it). Results show their publish date when known. | No |
 | `cast_crabs` | Cast of crabs mode (螃蟹群; a group of crabs is a cast, and mokuzu is モクズガニ, a mitten crab), modeled on Kimi's Agent Swarm and used when the model judges a task big enough, or whenever a message starts with `/cast <request>`. The model acts as an orchestrator and dispatches up to 10 named crabs per call, each with its own role and task, all running at once, while a live board shows what each one is doing. Crabs use only the read-only tools above, plus tools of MCP servers set to `approve = false`, and report back; the model sends more waves as needed and writes the answer. Needs web search configured. | No |

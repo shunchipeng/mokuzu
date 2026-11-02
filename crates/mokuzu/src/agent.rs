@@ -29,6 +29,7 @@ use crate::files;
 use crate::mcp::Mcp;
 use crate::memory;
 use crate::review::{self, Guard, Reviewer};
+use crate::sandbox;
 use crate::search;
 use crate::search::WebSearch;
 use crate::settings;
@@ -293,8 +294,8 @@ what's verified, and what's left, never a replay of the process. No filler, no r
 When unsure, say so plainly.
 
 # Tools
-Your built-in tools only read, except write_file, which writes only in your workspace folder; \
-you cannot run commands. Tools named <server>__<tool> come from MCP \
+Your built-in tools only read, except write_file, and run_code when offered, which write only in \
+your workspace folder; you cannot run commands outside that sandbox. Tools named <server>__<tool> come from MCP \
 servers the user connected and may act; the user may be asked to approve those calls, and if one is \
 denied, don't retry it or a variant. If you say you'll do something, make the call in the same response.
 Each user message starts with the time it was sent, like [sent 2026-01-02 09:00:00 CST ...]; \
@@ -1061,6 +1062,7 @@ impl Agent {
             .then(cron::tool)
             .into_iter()
             .chain(self.webhooks().map(|_| webhook::tool()))
+            .chain(sandbox::available().then(sandbox::tool))
             .chain(self.search.is_some().then(swarm::tool))
             .chain([files::send_tool()])
             .chain(self.mcp.tools().iter().cloned())
@@ -1121,6 +1123,13 @@ impl Agent {
                         files::read(&self.config, args).await
                     }
                     "list_dir" => files::list(&self.config, &call.function.arguments).await,
+                    "run_code" if sandbox::available() => {
+                        let args = &call.function.arguments;
+                        let lines = args["code"].as_str().map_or(0, |c| c.lines().count());
+                        io.note(&format!("🧪 running {lines} lines of code"))
+                            .await?;
+                        sandbox::run(&self.config, args).await
+                    }
                     "write_file" => {
                         let args = &call.function.arguments;
                         if let Some(path) = args["path"].as_str() {
