@@ -51,7 +51,7 @@ async fn start(port: u16) -> Result<String> {
 
 /// The address other machines on the network reach this one at: the one the default route
 /// leaves from. Connecting a UDP socket sends nothing.
-fn lan_ip() -> Option<IpAddr> {
+pub(crate) fn lan_ip() -> Option<IpAddr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     Some(socket.local_addr().ok()?.ip())

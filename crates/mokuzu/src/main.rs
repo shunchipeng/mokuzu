@@ -20,6 +20,7 @@ mod skill;
 mod swarm;
 mod todo;
 mod voice;
+mod webhook;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;

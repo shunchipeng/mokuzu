@@ -1,6 +1,7 @@
 //! Agent loop over Rig's provider clients, with read-only local tools.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -15,12 +16,13 @@ use rig_core::message::{
 };
 use rig_core::providers::{anthropic, gemini, openai};
 use serde_json::Value;
+use tokio::sync::Notify;
 
 use crate::browser;
 use crate::compact;
 use crate::config::{Api, Config, Provider};
 use crate::cron;
-use crate::db::Db;
+use crate::db::{self, Db};
 use crate::document;
 use crate::fetch::{self, Fetcher};
 use crate::files;
@@ -33,6 +35,37 @@ use crate::settings;
 use crate::skill;
 use crate::swarm;
 use crate::todo;
+use crate::webhook;
+
+/// Cuts a conversation's running turn short, e.g. on the user's `/stop`.
+#[derive(Debug, Default)]
+pub struct Stop {
+    notify: Notify,
+    running: AtomicBool,
+}
+
+impl Stop {
+    /// Stops the turn in progress; `false` if none is running.
+    pub fn stop(&self) -> bool {
+        if !self.running.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.notify.notify_waiters();
+        true
+    }
+}
+
+/// The error of a turn cut short by `Stop`.
+#[derive(Debug)]
+pub struct Stopped;
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stopped by the user")
+    }
+}
+
+impl std::error::Error for Stopped {}
 
 /// How long a new model gets to answer its test request before a switch is refused.
 const PING_TIMEOUT: Duration = Duration::from_secs(30);
@@ -260,7 +293,8 @@ what's verified, and what's left, never a replay of the process. No filler, no r
 When unsure, say so plainly.
 
 # Tools
-Your built-in tools only read; you cannot run commands. Tools named <server>__<tool> come from MCP \
+Your built-in tools only read, except write_file, which writes only in your workspace folder; \
+you cannot run commands. Tools named <server>__<tool> come from MCP \
 servers the user connected and may act; the user may be asked to approve those calls, and if one is \
 denied, don't retry it or a variant. If you say you'll do something, make the call in the same response.
 Each user message starts with the time it was sent, like [sent 2026-01-02 09:00:00 CST ...]; \
@@ -268,8 +302,9 @@ take the date and time from there, never from your own sense of today. Count rel
 it on a Monday-to-Sunday week: \"last Wednesday\" (上週三) is the Wednesday of the previous week, \
 \"this Wednesday\" (這週三) the one in the current week. When a relative date could mean two days, \
 say which date you used. Never answer from memory \
-what a tool can tell you, like file contents (read_file, list_dir). If a task needs a command run or a file changed, say what to run and let the \
-user do it.
+what a tool can tell you, like file contents (read_file, list_dir). If a task needs a command run or a file outside your \
+workspace changed, say what to run and let the user do it; to hand over something you made, write it in the workspace \
+and send_file it.
 Hidden paths (starting with .) are refused; don't try to get around that.
 If something fails and blocks you, say so and try another route. Never fabricate output.
 When the obvious interpretation is clear, act; ask only when the ambiguity changes what you would run.";
@@ -290,7 +325,7 @@ async fn system_prompt(db: &Db, config: &Config, user: u64) -> Result<String> {
         String::new()
     };
     Ok(format!(
-        "{IDENTITY}\n\n{tools}{guidance}\n\n{todo_guidance}\n\n{skills}\n\nOS: {os}. Working directory: {cwd}.\n\n{hint}\n\n{saved}\n\n{todos}",
+        "{IDENTITY}\n\n{tools}{guidance}\n\n{todo_guidance}\n\n{skills}\n\nOS: {os}. Working directory: {cwd}. Workspace: {workspace}.\n\n{hint}\n\n{saved}\n\n{todos}",
         guidance = memory::GUIDANCE,
         todo_guidance = todo::GUIDANCE,
         todos = todo::snapshot(&todos),
@@ -299,6 +334,7 @@ async fn system_prompt(db: &Db, config: &Config, user: u64) -> Result<String> {
         saved = memory::snapshot(&memories),
         os = os_name(),
         cwd = cwd.display(),
+        workspace = files::workspace(config).display(),
     ))
 }
 
@@ -383,6 +419,7 @@ pub(crate) fn request(
         tools: [
             files::read_tool(),
             files::list_tool(),
+            files::write_tool(),
             document::view_tool(),
             memory::tool(),
             memory::history_tool(),
@@ -444,6 +481,8 @@ pub struct Agent {
     /// Rebuilt by `run_turn` for its sender.
     system: String,
     messages: Vec<Message>,
+    /// Ends the running turn early; shared with whoever can stop it.
+    stop: Arc<Stop>,
 }
 
 impl Agent {
@@ -479,7 +518,19 @@ impl Agent {
             user: 0,
             system: String::new(),
             messages,
+            stop: Arc::default(),
         })
+    }
+
+    /// Lets `stop` cut this conversation's turns short.
+    pub fn stop_with(&mut self, stop: Arc<Stop>) {
+        self.stop = stop;
+    }
+
+    /// Puts every action that needs approval to the user, even in auto mode, for runs whose
+    /// prompt carries outside text that could talk a reviewer into approving.
+    pub fn ask_for_every_action(&mut self) {
+        self.reviewer = None;
     }
 
     /// Sets where this conversation's output goes, so todos written in it are followed up there.
@@ -587,6 +638,68 @@ impl Agent {
     /// them and posts back there. Job runs themselves can't schedule more.
     fn schedules(&self) -> bool {
         self.key.starts_with("discord:")
+    }
+
+    /// The webhook server's port, when this conversation can make webhooks.
+    fn webhooks(&self) -> Option<u16> {
+        self.config.webhook_port.filter(|_| self.schedules())
+    }
+
+    /// Runs one webhook tool call; problems go back to the model as text.
+    async fn webhook(&self, port: u16, args: &Value, io: &mut impl Io) -> Result<String> {
+        let text = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty());
+        match args["action"].as_str() {
+            Some("list") => Ok(webhook::list(&self.db.hooks().await?, port)),
+            Some("add") => {
+                let (Some(name), Some(prompt)) = (text("name"), text("prompt")) else {
+                    return Ok("error: `name` and `prompt` are required for add".to_owned());
+                };
+                let secret = webhook::secret()?;
+                let id = self
+                    .db
+                    .add_hook(
+                        self.key.clone(),
+                        self.user,
+                        name.to_owned(),
+                        prompt.to_owned(),
+                        secret.clone(),
+                    )
+                    .await?;
+                let hook = db::Hook {
+                    id,
+                    name: name.to_owned(),
+                    target: self.key.clone(),
+                    user: self.user,
+                    prompt: prompt.to_owned(),
+                    secret,
+                };
+                let note = format!(
+                    "🪝 webhook #{id} {name}: POST to {}\n{}",
+                    webhook::url(port, &hook),
+                    quote(prompt)
+                );
+                // A full message: the user needs the URL and should see the instructions.
+                io.say(&note).await?;
+                Ok(format!(
+                    "{note}\nThe URL works on this machine's network; services on the internet \
+                     need a tunnel (e.g. cloudflared, Tailscale Funnel) in front of port {port}."
+                ))
+            }
+            Some("remove") => {
+                let hooks = self.db.hooks().await?;
+                let (id, name) = match webhook::target(&hooks, args) {
+                    Ok(hook) => (hook.id, hook.name.clone()),
+                    Err(problem) => return Ok(format!("error: {problem}")),
+                };
+                self.db.remove_hook(id).await?;
+                let note = format!("🪝 removed webhook #{id} {name}");
+                io.note(&note).await?;
+                Ok(note)
+            }
+            other => Ok(format!(
+                "error: unknown action {other:?}; use add, list, or remove"
+            )),
+        }
     }
 
     /// Runs one cron tool call; problems go back to the model as text.
@@ -801,13 +914,25 @@ impl Agent {
         self.system = system_prompt(&self.db, &self.config, user).await?;
         self.compact_if_needed(prompt, io).await?;
         let turn_start = self.messages.len();
-        let result = match self.reviewer.clone() {
-            Some(reviewer) => {
-                let mut io = Guard::new(io, reviewer.as_ref(), prompt);
-                self.drive(prompt, images, &mut io).await
+        let stop = Arc::clone(&self.stop);
+        // Made before `running` is set, so a stop right after counts.
+        let stopped = stop.notify.notified();
+        stop.running.store(true, Ordering::SeqCst);
+        let drive = async {
+            match self.reviewer.clone() {
+                Some(reviewer) => {
+                    let mut io = Guard::new(io, reviewer.as_ref(), prompt);
+                    self.drive(prompt, images, &mut io).await
+                }
+                None => self.drive(prompt, images, io).await,
             }
-            None => self.drive(prompt, images, io).await,
         };
+        // Dropping `drive` mid-round leaves a partial round, which the cleanup below cuts off.
+        let result = tokio::select! {
+            result = drive => result,
+            () = stopped => Err(Stopped.into()),
+        };
+        stop.running.store(false, Ordering::SeqCst);
         if let Err(err) = &result {
             let kept = completed_rounds_end(&self.messages, turn_start);
             self.messages.truncate(kept);
@@ -935,6 +1060,7 @@ impl Agent {
             .schedules()
             .then(cron::tool)
             .into_iter()
+            .chain(self.webhooks().map(|_| webhook::tool()))
             .chain(self.search.is_some().then(swarm::tool))
             .chain([files::send_tool()])
             .chain(self.mcp.tools().iter().cloned())
@@ -995,6 +1121,13 @@ impl Agent {
                         files::read(&self.config, args).await
                     }
                     "list_dir" => files::list(&self.config, &call.function.arguments).await,
+                    "write_file" => {
+                        let args = &call.function.arguments;
+                        if let Some(path) = args["path"].as_str() {
+                            io.note(&format!("✏️ writing: {path}")).await?;
+                        }
+                        files::write(&self.config, args).await
+                    }
                     "send_file" => {
                         let sent = async {
                             let (name, bytes) =
@@ -1023,6 +1156,10 @@ impl Agent {
                     "search_history" => self.search_history(&call.function.arguments, io).await?,
                     "skill" => self.skill(&call.function.arguments, io).await?,
                     "cron" if self.schedules() => self.cron(&call.function.arguments, io).await?,
+                    "webhook" => match self.webhooks() {
+                        Some(port) => self.webhook(port, &call.function.arguments, io).await?,
+                        None => "error: webhooks are off; set [webhook] port".to_owned(),
+                    },
                     "settings" => self.settings(&call.function.arguments, io).await?,
                     "fetch_url" => {
                         let args = &call.function.arguments;
@@ -1128,6 +1265,18 @@ pub async fn ping(config: &Config) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stop_ends_only_a_running_turn() {
+        let stop = Stop::default();
+        assert!(!stop.stop(), "nothing running, nothing stopped");
+        let stopped = stop.notify.notified();
+        stop.running.store(true, Ordering::SeqCst);
+        assert!(stop.stop());
+        tokio::time::timeout(Duration::from_secs(1), stopped)
+            .await
+            .expect("a stop wakes the running turn");
+    }
 
     #[test]
     fn merge_users_folds_back_to_back_user_messages() {

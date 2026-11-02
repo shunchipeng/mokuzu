@@ -149,9 +149,10 @@ const VOICE_CHANNELS: usize = 39;
 const VOICE_NAME: usize = 40;
 const VOICE_MODEL: usize = 41;
 const VOICE_URL: usize = 42;
+const WEBHOOK_PORT: usize = 43;
 /// First of the rows for already configured MCP servers, followed by the configured Discord
 /// servers' rows.
-const MCP_FIRST: usize = 43;
+const MCP_FIRST: usize = 44;
 
 /// Focus value for the Save button under the fields.
 const BUTTON: usize = usize::MAX;
@@ -510,6 +511,15 @@ impl Form {
                 .map_or(config::DEFAULT_REALTIME_URL, |v| v.url.as_str())
                 .to_owned(),
         ));
+        fields.push(field(
+            STEP_ADVANCED,
+            "Webhook port",
+            Kind::Text,
+            current
+                .and_then(|c| c.webhook_port)
+                .map(|port| port.to_string())
+                .unwrap_or_default(),
+        ));
         let mcp_names: Vec<String> = current
             .map(|c| c.mcp.keys().cloned().collect())
             .unwrap_or_default();
@@ -807,6 +817,7 @@ impl Form {
                 self.timezone()?;
                 self.model_options()?;
                 self.browser_options()?;
+                self.number::<u16>(WEBHOOK_PORT, 1)?;
             }
         }
         Ok(())
@@ -1078,6 +1089,7 @@ impl Form {
                 })
                 .collect(),
             browser: self.browser_options()?,
+            webhook_port: self.number(WEBHOOK_PORT, 1)?,
         })
     }
 
@@ -1307,7 +1319,7 @@ impl Form {
             COMPACT_AT => self.number(i, config::MIN_COMPACT_AT_TOKENS).err(),
             BROWSER_WIDTH => self.number(i, config::MIN_SCREEN.0).err(),
             BROWSER_HEIGHT => self.number(i, config::MIN_SCREEN.1).err(),
-            VIEWER_PORT => self.number::<u16>(i, 1).err(),
+            VIEWER_PORT | WEBHOOK_PORT => self.number::<u16>(i, 1).err(),
             VOICE_URL => {
                 (!value.starts_with("wss://")).then(|| "must start with wss://".to_owned())
             }
@@ -1333,6 +1345,7 @@ const CHECKED: &[usize] = &[
     BROWSER_WIDTH,
     BROWSER_HEIGHT,
     VIEWER_PORT,
+    WEBHOOK_PORT,
 ];
 
 /// Background of the focused row.
@@ -1414,6 +1427,11 @@ fn help(i: usize) -> (&'static str, &'static str) {
              when mokuzu next starts."
         }
         VIEWER_PORT => "Port of the /browser live view on this machine's network.",
+        WEBHOOK_PORT => {
+            "Port on this machine's network that webhooks mokuzu makes listen on; each POST to \
+             one runs its instructions. Leave empty to turn webhooks off. Services on the \
+             internet need a tunnel in front of it. Takes effect when mokuzu next starts."
+        }
         PROVIDER => {
             "Where Mokuzu's model runs: OpenCode Go, or Anthropic's API for Claude with an \
              Anthropic API key. Each keeps its own API key, so switching back finds it again."
@@ -1535,6 +1553,8 @@ struct Answers {
     timezone: String,
     options: ModelOptions,
     browser: BrowserOptions,
+    /// `[webhook] port`; `None` leaves webhooks off.
+    webhook_port: Option<u16>,
 }
 
 /// `[browser]` keys.
@@ -1701,6 +1721,9 @@ fn render_toml(answers: &Answers) -> String {
             join_ids(&voice.channels)
         ));
     }
+    if let Some(port) = answers.webhook_port {
+        text.push_str(&format!("\n[webhook]\nport = {port}\n"));
+    }
     text
 }
 
@@ -1818,6 +1841,7 @@ mod tests {
                 height: 800,
                 viewer_port: 8765,
             },
+            webhook_port: Some(22051),
         });
         assert!(
             config::migrate(&text).expect("valid").is_none(),
@@ -1833,6 +1857,7 @@ mod tests {
         );
         assert_eq!(config.browser_screen, (1920, 800));
         assert_eq!(config.viewer_port, 8765);
+        assert_eq!(config.webhook_port, Some(22051));
         assert_eq!(config.model, "qwen3.8-max");
         assert_eq!(
             config.approval,
@@ -1871,6 +1896,7 @@ mod tests {
         assert_eq!(reopened.value(API), "openai");
         assert_eq!(reopened.value(COMPACT_AT), "50000");
         assert_eq!(reopened.value(VIEWER_PORT), "8765");
+        assert_eq!(reopened.value(WEBHOOK_PORT), "22051");
         assert_eq!(reopened.model_options().expect("valid").max_tokens, 8000);
         let first = reopened.guild_first();
         assert_eq!(reopened.fields[first].label, "100");
@@ -1929,6 +1955,7 @@ mod tests {
             timezone: "UTC".to_owned(),
             options: form.model_options().expect("valid"),
             browser: form.browser_options().expect("valid"),
+            webhook_port: None,
         });
         let config = Config::parse(&text).expect("valid");
         let Some(config::Search::Brave(brave)) = &config.search else {
@@ -2077,6 +2104,9 @@ mod tests {
         form.fields[VIEWER_PORT].value = "70000".to_owned();
         assert!(form.check_step(form.step).is_err(), "not a port");
         form.fields[VIEWER_PORT].value = config::DEFAULT_VIEWER_PORT.to_string();
+        form.fields[WEBHOOK_PORT].value = "0".to_owned();
+        assert!(form.check_step(form.step).is_err(), "not a port");
+        form.fields[WEBHOOK_PORT].value.clear();
         form.check_step(form.step).expect("advanced step valid");
         let browser = form.browser_options().expect("valid");
         assert_eq!(

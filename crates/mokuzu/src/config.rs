@@ -164,8 +164,16 @@ struct File {
     log: LogSection,
     discord: Option<DiscordSection>,
     voice: Option<VoiceSection>,
+    webhook: Option<WebhookSection>,
     database: DatabaseSection,
     browser: BrowserSection,
+}
+
+/// `[webhook]`: the HTTP server outside services post events to, waking webhooks.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebhookSection {
+    port: u16,
 }
 
 /// `[browser]`: the virtual desktop browsers draw on, and its live view.
@@ -537,6 +545,8 @@ pub struct Config {
     pub browser_screen: (u32, u32),
     /// Port of the `/browser` live view.
     pub viewer_port: u16,
+    /// Port the webhook server listens on; `None` turns webhooks off.
+    pub webhook_port: Option<u16>,
     /// File this was loaded from; empty when parsed from text.
     pub path: PathBuf,
 }
@@ -627,6 +637,10 @@ impl Config {
         if file.browser.viewer_port == 0 {
             bail!("browser.viewer_port must be between 1 and 65535");
         }
+        let webhook_port = file.webhook.map(|w| w.port);
+        if webhook_port == Some(0) {
+            bail!("webhook.port must be between 1 and 65535");
+        }
         let timezone = file.timezone.parse().map_err(|_| {
             anyhow::anyhow!(
                 "timezone {:?} is not an IANA time zone like Asia/Taipei",
@@ -670,6 +684,7 @@ impl Config {
             timezone,
             browser_screen,
             viewer_port: file.browser.viewer_port,
+            webhook_port,
             path: PathBuf::new(),
         })
     }
@@ -813,6 +828,19 @@ mod tests {
         );
         assert!(Config::parse(&format!("{key}[browser]\nwidth = 100\n")).is_err());
         assert!(Config::parse(&format!("{key}[browser]\nviewer_port = 0\n")).is_err());
+    }
+
+    #[test]
+    fn webhook_section_sets_port() {
+        let key = "[opencode-go]\napi_key = \"k\"\n";
+        assert_eq!(Config::parse(key).expect("valid").webhook_port, None);
+        let set = format!("{key}[webhook]\nport = 22051\n");
+        assert_eq!(
+            Config::parse(&set).expect("valid").webhook_port,
+            Some(22051)
+        );
+        assert!(Config::parse(&format!("{key}[webhook]\nport = 0\n")).is_err());
+        assert!(Config::parse(&format!("{key}[webhook]\n")).is_err());
     }
 
     #[test]

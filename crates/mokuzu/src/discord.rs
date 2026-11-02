@@ -22,14 +22,15 @@ use serenity::async_trait;
 use songbird::serenity::SerenityInit as _;
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::agent::{self, Agent, Io};
+use crate::agent::{self, Agent, Io, Stop, Stopped};
 use crate::config::{Config, DiscordSection, VoiceSection};
 use crate::cron;
-use crate::db::{Db, Job, Todo};
+use crate::db::{Db, Hook, Job, Todo};
 use crate::document;
 use crate::mcp::Mcp;
 use crate::todo::{self, Quiet};
 use crate::voice;
+use crate::webhook;
 
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How long a turn waits for another message before starting, so a burst is answered once.
@@ -42,6 +43,10 @@ const MAX_MESSAGE_CHARS: usize = 1_900;
 const RECEIVED: char = '👀';
 const DONE: char = '✅';
 const FAILED: char = '❌';
+/// Reaction to a `/stop` with no turn running.
+const NOTHING_TO_STOP: char = '💤';
+/// Stops the running turn of the conversation it is sent in.
+const STOP_COMMAND: &str = "/stop";
 const RUN: &str = "mokuzu:run";
 const DENY: &str = "mokuzu:deny";
 /// Longest status line kept; statuses are one-line summaries.
@@ -119,6 +124,16 @@ pub async fn serve(config: Config) -> Result<()> {
         builder = builder.register_songbird_with(songbird);
     }
     let mut client = builder.await.context("failed to build Discord client")?;
+    if let Some(port) = config.webhook_port {
+        let events = webhook::listen(port, db.clone()).await?;
+        tokio::spawn(run_hooks(
+            config.clone(),
+            db.clone(),
+            Arc::clone(&mcp),
+            Arc::clone(&client.http),
+            events,
+        ));
+    }
     tokio::spawn(run_scheduler(config, db, mcp, Arc::clone(&client.http)));
     client.start().await.context("Discord connection failed")
 }
@@ -350,6 +365,76 @@ async fn run_job(config: Config, db: Db, mcp: Arc<Mcp>, http: Arc<Http>, job: Jo
     }
 }
 
+/// Runs each webhook request as it comes; a webhook's requests run one after another.
+async fn run_hooks(
+    config: Config,
+    db: Db,
+    mcp: Arc<Mcp>,
+    http: Arc<Http>,
+    mut events: mpsc::UnboundedReceiver<(Hook, String)>,
+) {
+    // One run at a time per webhook, so its runs never share a conversation.
+    // ponytail: one lock per webhook id ever woken, never freed; prune if webhooks churn a lot.
+    let mut locks: HashMap<i64, Arc<tokio::sync::Mutex<()>>> = HashMap::new();
+    while let Some((hook, body)) = events.recv().await {
+        let lock = Arc::clone(locks.entry(hook.id).or_default());
+        let (config, db, mcp, http) = (
+            config.clone(),
+            db.clone(),
+            Arc::clone(&mcp),
+            Arc::clone(&http),
+        );
+        tokio::spawn(async move {
+            let _turn = lock.lock().await;
+            run_hook(config, db, mcp, http, hook, body).await;
+        });
+    }
+}
+
+/// Runs one webhook request in the webhook's own fresh conversation and posts the result where
+/// the webhook was made.
+#[tracing::instrument(skip_all, fields(hook = hook.id))]
+async fn run_hook(
+    config: Config,
+    db: Db,
+    mcp: Arc<Mcp>,
+    http: Arc<Http>,
+    hook: Hook,
+    body: String,
+) {
+    let Some(mut io) = unattended_io(http, &hook.target) else {
+        return;
+    };
+    let run = async {
+        io.note(&format!("🪝 webhook #{} {}", hook.id, hook.name))
+            .await?;
+        let mut agent = Agent::new(config, db, mcp, &format!("webhook:{}", hook.id)).await?;
+        agent.reset().await?;
+        agent.posts_to(&hook.target);
+        agent.ask_for_every_action();
+        agent
+            .run_turn(
+                &webhook::prompt(&hook, &body),
+                Vec::new(),
+                hook.user,
+                &mut io,
+            )
+            .await
+    };
+    if let Err(err) = run.await {
+        tracing::warn!("webhook run failed: {err:#}");
+        if let Err(err) = io
+            .say(&format!(
+                "error: webhook #{} {} failed: {err:#}",
+                hook.id, hook.name
+            ))
+            .await
+        {
+            tracing::error!("failed to report webhook failure: {err:#}");
+        }
+    }
+}
+
 struct Handler {
     db: Db,
     /// Who the bot acts on, in DMs and in each server.
@@ -369,9 +454,12 @@ struct Inboxes {
     mcp: Arc<Mcp>,
     config: Config,
     db: Db,
-    /// Inbox of the task that owns each channel's conversation.
-    channels: Mutex<HashMap<ChannelId, mpsc::UnboundedSender<Input>>>,
+    /// Inbox of the task that owns each channel's conversation, and what stops its turn.
+    channels: Mutex<HashMap<ChannelId, ChannelTask>>,
 }
+
+/// A channel's agent task: its inbox, and what stops its running turn.
+type ChannelTask = (mpsc::UnboundedSender<Input>, Arc<Stop>);
 
 impl Inboxes {
     /// Hands `input` to the channel's agent task, starting one for text if none is running.
@@ -383,22 +471,33 @@ impl Inboxes {
         if !channels.contains_key(&channel) && matches!(input, Input::Decision { .. }) {
             return; // A click on an old approval; nothing is waiting for it.
         }
-        let inbox = channels.entry(channel).or_insert_with(|| {
+        let (inbox, _) = channels.entry(channel).or_insert_with(|| {
             let (tx, rx) = mpsc::unbounded_channel();
+            let stop = Arc::new(Stop::default());
             tokio::spawn(run_channel(
                 self.config.clone(),
                 self.db.clone(),
                 Arc::clone(&self.mcp),
                 Arc::clone(http),
                 channel,
+                Arc::clone(&stop),
                 rx,
             ));
-            tx
+            (tx, stop)
         });
         if inbox.send(input).is_err() {
             // The channel task died; drop it so the next message starts a fresh one.
             channels.remove(&channel);
         }
+    }
+}
+
+impl Inboxes {
+    /// Stops the turn running in `channel`; `false` if none is.
+    fn stop(&self, channel: ChannelId) -> bool {
+        lock(&self.channels)
+            .get(&channel)
+            .is_some_and(|(_, stop)| stop.stop())
     }
 }
 
@@ -583,6 +682,18 @@ impl Handler {
         self.deliver(&ctx.http, msg.channel_id, input);
     }
 
+    /// `/stop` typed as text: stops the turn running in `msg`'s conversation.
+    async fn stop(&self, ctx: &Context, msg: &Message) {
+        let reaction = if self.inboxes.stop(msg.channel_id) {
+            DONE
+        } else {
+            NOTHING_TO_STOP
+        };
+        if let Err(err) = msg.react(&ctx.http, reaction).await {
+            tracing::warn!("failed to react to message: {err:#}");
+        }
+    }
+
     /// Starts a turn for `content`: acknowledges `msg`, opens a thread on it in a server text
     /// channel, and hands the prompt to that conversation.
     async fn accept(
@@ -632,6 +743,19 @@ impl Handler {
         {
             let reply = CreateInteractionResponseMessage::new()
                 .content("You are not allowed to talk to this bot.")
+                .ephemeral(true);
+            return Ok(command
+                .create_response(&ctx.http, CreateInteractionResponse::Message(reply))
+                .await?);
+        }
+        if command.data.name == STOP_COMMAND[1..] {
+            let text = if self.inboxes.stop(command.channel_id) {
+                "⏹️ stopping"
+            } else {
+                "Nothing is running here."
+            };
+            let reply = CreateInteractionResponseMessage::new()
+                .content(text)
                 .ephemeral(true);
             return Ok(command
                 .create_response(&ctx.http, CreateInteractionResponse::Message(reply))
@@ -714,10 +838,19 @@ impl EventHandler for Handler {
             return;
         }
         let content = strip_mention(&msg.content, bot);
+        if content == STOP_COMMAND {
+            self.stop(&ctx, &msg).await;
+            return;
+        }
         let attachments = msg
             .attachments
             .iter()
-            .filter(|a| image_type(a).is_some() || is_text(a) || is_document(a))
+            .filter(|a| {
+                image_type(a).is_some()
+                    || is_text(a)
+                    || is_document(a)
+                    || (self.voice.is_some() && is_audio(a))
+            })
             .cloned()
             .collect();
         self.accept(&ctx, &msg, content, attachments, author).await;
@@ -739,6 +872,8 @@ impl EventHandler for Handler {
                 ),
             CreateCommand::new("browser")
                 .description("Get a link to a live view of mokuzu's browser"),
+            CreateCommand::new(&STOP_COMMAND[1..])
+                .description("Stop what mokuzu is doing in this conversation"),
         ];
         if self.voice.is_some() {
             commands.push(
@@ -875,9 +1010,11 @@ async fn run_channel(
     mcp: Arc<Mcp>,
     http: Arc<Http>,
     channel: ChannelId,
+    stop: Arc<Stop>,
     inbox: mpsc::UnboundedReceiver<Input>,
 ) {
     let key = format!("discord:{channel}");
+    let voice = config.voice.clone();
     let mut agent = match Agent::new(config, db, mcp, &key).await {
         Ok(agent) => agent,
         Err(err) => {
@@ -885,6 +1022,7 @@ async fn run_channel(
             return;
         }
     };
+    agent.stop_with(stop);
     let mut io = DiscordIo {
         http,
         web: reqwest::Client::new(),
@@ -944,7 +1082,7 @@ async fn run_channel(
         }
         io.status = None;
         let typing = io.channel.start_typing(&io.http);
-        let result = match download(&io.web, &attachments).await {
+        let result = match download(&io.web, &attachments, voice.as_ref()).await {
             Ok((text, images)) => {
                 let prompt = format!("{prompt}{text}");
                 agent.run_turn(prompt.trim(), images, author, &mut io).await
@@ -960,7 +1098,12 @@ async fn run_channel(
         }
         if let Err(err) = &result {
             tracing::warn!("turn failed: {err:#}");
-            if let Err(err) = io.say(&format!("error: {err:#}")).await {
+            let text = if err.is::<Stopped>() {
+                "⏹️ stopped".to_owned()
+            } else {
+                format!("error: {err:#}")
+            };
+            if let Err(err) = io.say(&text).await {
                 tracing::error!("failed to report error: {err:#}");
             }
         }
@@ -1249,6 +1392,14 @@ fn is_text(attachment: &Attachment) -> bool {
         .is_some_and(|mime| mime.starts_with("text/") || mime.starts_with("application/json"))
 }
 
+/// Whether the attachment is audio, like a Discord voice message, to transcribe into the prompt.
+fn is_audio(attachment: &Attachment) -> bool {
+    attachment
+        .content_type
+        .as_deref()
+        .is_some_and(|mime| mime.starts_with("audio/"))
+}
+
 /// Whether the attachment is a PDF or Office document to read into the prompt as text.
 fn is_document(attachment: &Attachment) -> bool {
     document::has_document_name(&attachment.filename)
@@ -1256,17 +1407,26 @@ fn is_document(attachment: &Attachment) -> bool {
 
 /// Downloads `attachments` for the model: text files as prompt text to append, images as images.
 /// Documents become their text, cut to `MAX_DOCUMENT_CHARS`, and a PDF's first pages also come as
-/// images. Files over `MAX_TEXT_BYTES`, `MAX_IMAGE_BYTES`, or `document::MAX_BYTES` are left out.
+/// images. Audio becomes its transcript with `voice`'s key, and is left out without one. Files
+/// over `MAX_TEXT_BYTES`, `MAX_IMAGE_BYTES`, `document::MAX_BYTES`, or
+/// `voice::MAX_TRANSCRIBE_BYTES` are left out.
 async fn download(
     web: &reqwest::Client,
     attachments: &[Attachment],
+    voice: Option<&VoiceSection>,
 ) -> Result<(String, Vec<Image>)> {
     let mut text = String::new();
     let mut images = Vec::new();
     for attachment in attachments {
         let media_type = image_type(attachment);
+        let audio = is_audio(attachment).then_some(voice).flatten();
+        if is_audio(attachment) && audio.is_none() {
+            continue;
+        }
         let limit = if media_type.is_some() {
             MAX_IMAGE_BYTES
+        } else if audio.is_some() {
+            voice::MAX_TRANSCRIBE_BYTES
         } else if is_document(attachment) {
             u32::try_from(document::MAX_BYTES).unwrap_or(u32::MAX)
         } else {
@@ -1291,6 +1451,16 @@ async fn download(
             .with_context(|| format!("failed to download {}", attachment.filename))?;
         if media_type.is_some() {
             images.push(document::image(&bytes, media_type));
+        } else if let Some(section) = audio {
+            let body =
+                match voice::transcribe(web, section, &attachment.filename, bytes.to_vec()).await {
+                    Ok(transcript) => transcript,
+                    Err(err) => format!("(could not transcribe this audio: {err:#})"),
+                };
+            text.push_str(&format!(
+                "\n\n[voice message {}, transcribed]\n{body}",
+                attachment.filename
+            ));
         } else if is_document(attachment) {
             let body = match document::extract(bytes.to_vec()).await {
                 Ok(body) => clip(&body, MAX_DOCUMENT_CHARS),

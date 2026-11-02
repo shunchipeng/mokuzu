@@ -19,7 +19,7 @@ iana-time-zone = "0.1.65"
 include_dir = "0.7.4"
 pdf-extract = "0.12.1"
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "multipart", "rustls"] }
 rig-core = "0.42.0"
 rmcp = { version = "3.4.1", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }

@@ -1,6 +1,8 @@
-//! Read-only file tools: `read_file`, `list_dir`, and `send_file`. They run without approval, so they refuse
-//! hidden paths (any component starting with `.`, like `~/.ssh` or `.env`) and Mokuzu's own config
-//! and database, which hold API keys, tokens, and every conversation.
+//! File tools: `read_file`, `list_dir`, and `send_file` read, and `write_file` writes only inside
+//! Mokuzu's workspace folder. They run without approval, so they refuse hidden paths (any
+//! component starting with `.`, like `~/.ssh` or `.env`) and Mokuzu's own config and database,
+//! which hold API keys, tokens, and every conversation. The workspace sits next to the database,
+//! itself under a hidden folder, so paths inside it are checked only below it.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -18,6 +20,99 @@ const MAX_CHARS: usize = 15_000;
 const MAX_BYTES: u64 = 5_000_000;
 /// Entries listed per `list_dir` call.
 const MAX_ENTRIES: usize = 500;
+/// Largest `content` one `write_file` call takes.
+const MAX_WRITE_BYTES: usize = 1_000_000;
+
+/// The folder `write_file` writes into: `workspace` next to the database.
+pub fn workspace(config: &Config) -> PathBuf {
+    config
+        .database_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("workspace")
+}
+
+pub fn write_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "write_file".to_owned(),
+        description: "Write a text file in your workspace folder, the only place you can write: \
+             notes, drafts, CSV, Markdown, HTML, code. `path` is relative to the workspace, \
+             like `reports/prices.csv`; folders are made as needed. Overwrites the file unless \
+             `append` is true. read_file, list_dir, and send_file reach it by the absolute path \
+             this returns, e.g. to send the user what you wrote."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path inside the workspace."},
+                "content": {"type": "string", "description": "The text to write."},
+                "append": {
+                    "type": "boolean",
+                    "description": "Add to the end of the file instead of replacing it. Default false.",
+                },
+            },
+            "required": ["path", "content"],
+        }),
+    }
+}
+
+/// Runs one `write_file` call; failures come back as text for the model.
+pub async fn write(config: &Config, args: &Value) -> String {
+    match write_text(config, args).await {
+        Ok(out) => out,
+        Err(err) => format!("error: {err:#}"),
+    }
+}
+
+async fn write_text(config: &Config, args: &Value) -> Result<String> {
+    let relative = args["path"]
+        .as_str()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .context("`path` is required")?;
+    let content = args["content"].as_str().context("`content` is required")?;
+    if content.len() > MAX_WRITE_BYTES {
+        bail!("`content` is over {MAX_WRITE_BYTES} bytes");
+    }
+    let relative = Path::new(relative);
+    // Only plain names, so the path can't climb out of the workspace or name a hidden file.
+    if !relative
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)))
+        || is_hidden(relative)
+    {
+        bail!("`path` must be relative to the workspace, without `..` or hidden names");
+    }
+    let root = workspace(config);
+    let path = root.join(relative);
+    let parent = path.parent().context("`path` names no file")?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("cannot create {}", parent.display()))?;
+    // Canonical, so a symlink inside the workspace can't lead the write elsewhere.
+    let root = tokio::fs::canonicalize(&root).await?;
+    if !tokio::fs::canonicalize(parent).await?.starts_with(&root) {
+        bail!("{} leads out of the workspace", relative.display());
+    }
+    let append = args["append"].as_bool().unwrap_or(false);
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(&path)
+        .await
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, content.as_bytes())
+        .await
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    let verb = if append { "appended to" } else { "wrote" };
+    Ok(format!(
+        "{verb} {} ({} bytes)",
+        path.display(),
+        content.len()
+    ))
+}
 
 pub fn read_tool() -> ToolDefinition {
     ToolDefinition {
@@ -203,7 +298,12 @@ async fn resolve(config: &Config, path: &Value) -> Result<PathBuf> {
     let path = tokio::fs::canonicalize(&path)
         .await
         .with_context(|| format!("cannot open {}", path.display()))?;
-    if is_hidden(&path) {
+    let workspace = tokio::fs::canonicalize(workspace(config)).await.ok();
+    let checked = workspace
+        .as_deref()
+        .and_then(|root| path.strip_prefix(root).ok())
+        .unwrap_or(&path);
+    if is_hidden(checked) {
         bail!("{} is hidden; hidden paths are refused", path.display());
     }
     for secret in [&config.path, &config.database_path] {
@@ -300,5 +400,38 @@ mod tests {
         );
         assert!(!list(&config, &path("sub")).await.contains(".env"));
         std::fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[tokio::test]
+    async fn write_stays_in_the_workspace_and_reads_back() {
+        let dir = std::env::temp_dir()
+            .join(format!("mokuzu-write-{}", std::process::id()))
+            .join(".hidden");
+        let config = Config {
+            database_path: dir.join("mokuzu.db"),
+            ..Config::parse("[opencode-go]\napi_key = \"k\"\n").expect("valid")
+        };
+        let write_args =
+            |p: &str, append: bool| json!({ "path": p, "content": "hi\n", "append": append });
+
+        let out = write(&config, &write_args("notes/a.md", false)).await;
+        assert!(out.starts_with("wrote "), "{out}");
+        write(&config, &write_args("notes/a.md", true)).await;
+        let file = workspace(&config).join("notes/a.md");
+        // Readable though the workspace sits under a hidden folder.
+        assert!(
+            read(&config, &json!({ "path": file }))
+                .await
+                .ends_with("hi\nhi\n")
+        );
+        for bad in ["../escape.md", "/tmp/abs.md", "notes/.env", ""] {
+            assert!(
+                write(&config, &write_args(bad, false))
+                    .await
+                    .starts_with("error:"),
+                "{bad}"
+            );
+        }
+        std::fs::remove_dir_all(dir.parent().expect("parent")).expect("clean up");
     }
 }

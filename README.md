@@ -11,8 +11,9 @@ servers such as Linear, and runs scheduled jobs.
 The name is モクズ (mokuzu), from モクズガニ, the Japanese mitten crab; its hairy claws look like
 they hold a tuft of seaweed scraps (藻屑).
 
-Mokuzu's own tools only read. Anything that changes something (an MCP call or a settings
-change) asks you first, or goes past a reviewer model in auto mode.
+Mokuzu's own tools only read, except that it can write files in its own workspace folder.
+Anything else that changes something (an MCP call or a settings change) asks you first, or goes
+past a reviewer model in auto mode.
 
 ## Install
 
@@ -94,14 +95,15 @@ How it behaves:
   Idle threads archive after an hour.
 - Each person has their own memory, shared by all of their threads, DMs, and voice calls.
   Messages from different people are never merged into one turn.
-- 👀 means received, ✅ done, ❌ failed. `/cast <request>` sends out a cast of crabs, and `/browser` gives a link to a live view of mokuzu's desktop. Both show up in Discord's `/` menu, and typing them as text works too.
+- 👀 means received, ✅ done, ❌ failed. `/cast <request>` sends out a cast of crabs, `/browser` gives a link to a live view of mokuzu's desktop, and `/stop` cuts short what mokuzu is doing in that conversation (💤 if nothing is running). They show up in Discord's `/` menu, and typing them as text works too.
 - Messages sent in quick succession, or while mokuzu is still answering, are merged and answered
   once.
 - Images, text files (including the `message.txt` Discord makes from a long paste), and PDF,
   Word (`.docx`), and PowerPoint (`.pptx`) documents you attach go to the model; documents as
   their text, up to 50,000 characters. A PDF's first 3 pages also go as images, and the model can
   look at any other page with `view_pdf`, so it sees the tables, figures, and scanned pages its
-  text misses.
+  text misses. With `[voice]` set, voice messages and other audio files go as their transcript,
+  made with OpenAI's `gpt-4o-mini-transcribe` in the call `language`.
 - Approvals show up as **Run** and **Deny** buttons.
 
 ### Voice calls
@@ -148,6 +150,7 @@ Logs:
 | `read_file`, `list_dir` | Reads files, including the text of PDF, `.docx`, and `.pptx` documents up to 20 MB, and lists directories. Hidden paths (like `~/.ssh` or `.env`) and Mokuzu's own config and database are refused. | No |
 | `fetch_url` | Reads a web page as text, or a linked PDF, `.docx`, or `.pptx` document up to 20 MB; a PDF's first 3 pages also come as images. Private network addresses are refused. | No |
 | `view_pdf` | Shows the model pages of a local or linked PDF as images, up to 10 per call, for layout, tables, figures, and scans that the text misses. Same path and address rules as `read_file` and `fetch_url`. | No |
+| `write_file` | Writes or appends to a text file in mokuzu's workspace (`workspace/` next to the database), the only place it can write; `read_file`, `list_dir`, and `send_file` reach it too, so it can hand you a CSV or report it made. | No |
 | `send_file` | Sends a local file or a downloaded one (under 3 MB) as an attachment, e.g. an image the user asked to see. Same path and address rules as `read_file` and `fetch_url`. | No |
 | `web_search` | Searches through your SearXNG instance or the Brave Search API (pick one in `mokuzu configure`), optionally only recent results (`time_range`), news sites (`category`), or a date span (`after`, `before`; on SearXNG only Google engines honor it). Results show their publish date when known. | No |
 | `cast_crabs` | Cast of crabs mode (螃蟹群; a group of crabs is a cast, and mokuzu is モクズガニ, a mitten crab), modeled on Kimi's Agent Swarm and used when the model judges a task big enough, or whenever a message starts with `/cast <request>`. The model acts as an orchestrator and dispatches up to 10 named crabs per call, each with its own role and task, all running at once, while a live board shows what each one is doing. Crabs use only the read-only tools above, plus tools of MCP servers set to `approve = false`, and report back; the model sends more waves as needed and writes the answer. Needs web search configured. | No |
@@ -156,6 +159,7 @@ Logs:
 | `search_history` | Searches messages that are no longer in context: earlier ones of the same conversation that a summary replaced, and the person's own messages and the replies to them in their other conversations (threads, DMs, voice calls, scheduled runs). Other people's messages stay out of it. Matches what the user and the model wrote, not tool output; Chinese and Japanese work without word splitting. Messages saved before 0.5.32 are found only in their own conversation. | No |
 | `skill` | Loads, saves, or removes skills: saved instructions for recurring tasks, kept in the database, one set per person like memory. Their names and descriptions are listed in each of that person's conversations; the model loads one when a task comes close to one, saves a finished multi-step task as a new one, and updates a skill when following it went wrong or you corrected it. Saving runs without asking and says what it saved. | Remove |
 | `cron` | Schedules a named prompt to run later, once (`at`) or on a cron expression, in the config's `timezone` (restart `mokuzu serve` after changing it). Each run starts a fresh conversation and posts its reply in the Discord channel or thread where the job was made. Discord only; jobs run while `mokuzu serve` is up, and a run missed while it was down happens once on startup. Approval prompts during a run are denied unless approval is set to auto. A job's instructions are shown when it is made or changed; ask to change its instructions or timing, remove it, or give it a trial run now (posted where the job was made, schedule unchanged). | No |
+| `webhook` | With `[webhook]` set, makes a named webhook: a secret URL, `http://<this machine>:<port>/hook/<secret>`, that outside services POST to. Each request runs the webhook's instructions with the request body (up to 64 KB, given to the model as untrusted data) in a fresh conversation, and posts the reply where the webhook was made. Requests to one webhook run one at a time. Approval prompts during a run are denied, even in auto mode. The port is on your local network; put a tunnel in front of it for services on the internet. Discord only. | No |
 | `settings` | Reads or changes the model and a few limits. | Yes |
 | MCP tools | Any tool from the MCP servers you connect. | Yes, per server |
 

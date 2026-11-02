@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::OnceCell;
 
-mod viewer;
+pub(crate) mod viewer;
 
 /// The `/browser` command: a link to a live view of the desktop, to watch it.
 pub const BROWSER_COMMAND: &str = "/browser";

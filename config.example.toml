@@ -111,7 +111,7 @@ allowed_users = [123456789012345678]
 # # Answer only messages that @mention the bot, in its threads too.
 # mention_only = true
 
-# Optional. Voice calls: send /voice in a server while you are in one of its voice
+# Optional. Voice calls, and transcripts of voice messages and other audio you attach: send /voice in a server while you are in one of its voice
 # channels, and mokuzu joins it and talks with you through OpenAI's Realtime API. The realtime
 # model holds the conversation and hands anything past small talk to mokuzu's agent, which answers
 # in the channel you sent /voice from. /hangup ends the call.
@@ -127,3 +127,10 @@ allowed_users = [123456789012345678]
 # # Voice channel IDs mokuzu joins on its own when someone allowed to talk to it joins; the
 # # agent answers in the channel's text chat. [] for /voice only.
 # channels = []
+
+# Optional. Webhooks: ask mokuzu to make one (e.g. "when GitHub CI finishes, tell me how it
+# went"), and it gives you a secret URL on this port. Each POST to that URL runs the webhook's
+# instructions on the request body, in a fresh conversation that posts where it was made. The
+# port is on this machine's network; put a tunnel in front of it for services on the internet.
+# [webhook]
+# port = 22051

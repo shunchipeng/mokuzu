@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use include_dir::{Dir, include_dir};
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, OptionalExtension as _, Row, params};
 use rusqlite_migration::Migrations;
 use serde_json::Value;
 
@@ -117,6 +117,33 @@ pub struct Job {
     pub next_run: i64,
 }
 
+/// Row of `webhooks`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hook {
+    pub id: i64,
+    pub name: String,
+    /// Conversation key the webhook was made in, where its runs post.
+    pub target: String,
+    /// Discord user who made it, whose memory its runs load.
+    pub user: u64,
+    pub prompt: String,
+    /// Path segment after `/hook/` that wakes it.
+    pub secret: String,
+}
+
+impl Hook {
+    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get("id")?,
+            name: row.get("name")?,
+            target: row.get("target")?,
+            user: row.get::<_, i64>("user_id")?.cast_unsigned(),
+            prompt: row.get("prompt")?,
+            secret: row.get("secret")?,
+        })
+    }
+}
+
 impl Job {
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
@@ -191,7 +218,7 @@ impl Db {
     }
 
     #[cfg(test)]
-    fn open_in_memory() -> Result<Self> {
+    pub(crate) fn open_in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?)
     }
 
@@ -496,6 +523,61 @@ impl Db {
         })
         .await
     }
+
+    /// Every webhook, oldest first.
+    pub async fn hooks(&self) -> Result<Vec<Hook>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, target, user_id, prompt, secret FROM webhooks ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], Hook::from_row)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+    }
+
+    /// The webhook woken by `secret`, if any.
+    pub async fn hook_by_secret(&self, secret: String) -> Result<Option<Hook>> {
+        self.with_conn(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT id, name, target, user_id, prompt, secret FROM webhooks
+                     WHERE secret = ?1",
+                    params![secret],
+                    Hook::from_row,
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    /// Stores a webhook that posts to the conversation `target` and returns its id.
+    pub async fn add_hook(
+        &self,
+        target: String,
+        user: u64,
+        name: String,
+        prompt: String,
+        secret: String,
+    ) -> Result<i64> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO webhooks (name, target, user_id, prompt, secret)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![name, target, sql_user(user), prompt, secret],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+    }
+
+    /// Deletes a webhook; false if there was none with that id.
+    pub async fn remove_hook(&self, id: i64) -> Result<bool> {
+        self.with_conn(move |conn| {
+            Ok(conn.execute("DELETE FROM webhooks WHERE id = ?1", params![id])? > 0)
+        })
+        .await
+    }
 }
 
 impl Db {
@@ -583,6 +665,29 @@ mod tests {
     #[test]
     fn migrations_are_valid() {
         migrations().expect("load").validate().expect("valid");
+    }
+
+    #[tokio::test]
+    async fn webhooks_are_found_by_secret_and_removed() {
+        let db = Db::open_in_memory().expect("open");
+        let id = db
+            .add_hook(
+                "discord:1".into(),
+                7,
+                "CI".into(),
+                "report".into(),
+                "s3cret".into(),
+            )
+            .await
+            .expect("add");
+        let hook = db.hook_by_secret("s3cret".into()).await.expect("query");
+        assert_eq!(hook.as_ref().map(|h| (h.id, h.user)), Some((id, 7)));
+        assert_eq!(
+            db.hook_by_secret("other".into()).await.expect("query"),
+            None
+        );
+        assert!(db.remove_hook(id).await.expect("remove"));
+        assert!(db.hooks().await.expect("list").is_empty());
     }
 
     #[tokio::test]

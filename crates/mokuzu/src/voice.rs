@@ -33,6 +33,46 @@ pub const VOICE_COMMAND: &str = "/voice";
 pub const HANGUP_COMMAND: &str = "/hangup";
 
 /// Sample rate of audio both ways.
+/// OpenAI's speech-to-text endpoint, for voice messages sent as attachments.
+const TRANSCRIBE_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
+const TRANSCRIBE_MODEL: &str = "gpt-4o-mini-transcribe";
+/// OpenAI rejects audio files over 25 MB.
+pub const MAX_TRANSCRIBE_BYTES: u32 = 25 * 1024 * 1024;
+
+/// Transcribes the audio file `bytes`, named `name`, with the `[voice]` key; the call's
+/// `language` steers the script (e.g. Traditional over Simplified Chinese).
+pub async fn transcribe(
+    web: &reqwest::Client,
+    section: &VoiceSection,
+    name: &str,
+    bytes: Vec<u8>,
+) -> Result<String> {
+    let file = reqwest::multipart::Part::bytes(bytes).file_name(name.to_owned());
+    let form = reqwest::multipart::Form::new()
+        .text("model", TRANSCRIBE_MODEL)
+        .text("response_format", "json")
+        .text(
+            "prompt",
+            format!("The speaker most likely talks in {}.", section.language),
+        )
+        .part("file", file);
+    let body: Value = web
+        .post(TRANSCRIBE_URL)
+        .bearer_auth(section.api_key.as_str())
+        .multipart(form)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .context("transcription request failed")?
+        .json()
+        .await
+        .context("transcription response unreadable")?;
+    body["text"]
+        .as_str()
+        .map(|text| text.trim().to_owned())
+        .context("transcription response had no text")
+}
+
 const RATE: usize = 24_000;
 /// Samples in one 20 ms Discord frame at `RATE`.
 const FRAME: usize = RATE / 50;
